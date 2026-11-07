@@ -1,0 +1,12 @@
+{
+  "name": "runner-radar",
+  "owner": { "name": "Ruben Alderete", "url": "https://github.com/AldereteRuben" },
+  "description": "Runner Radar: a live view of your self-hosted GitHub Actions runners in Claude Code",
+  "plugins": [
+    {
+      "name": "runner-radar",
+      "source": "./",
+      "description": "Live radar for your self-hosted GitHub Actions runners: who is busy with what, what is waiting and for how long."
+    }
+  ]
+}

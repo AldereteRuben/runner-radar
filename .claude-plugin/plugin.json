@@ -1,0 +1,65 @@
+{
+  "name": "runner-radar",
+  "displayName": "Runner Radar",
+  "version": "0.1.0",
+  "description": "Live radar for your self-hosted GitHub Actions runners inside Claude Code: who is busy with what, what is waiting in the queue and for how long, across all your repos.",
+  "author": { "name": "Ruben Alderete", "url": "https://github.com/AldereteRuben" },
+  "homepage": "https://github.com/AldereteRuben/runner-radar",
+  "repository": "https://github.com/AldereteRuben/runner-radar",
+  "license": "MIT",
+  "keywords": ["github-actions", "self-hosted-runners", "ci", "devops", "homelab", "mod"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the pane, status line and alerts: en (English) or es (Español). /radar es or /radar en switches it for the session.",
+      "options": ["en", "es"],
+      "default": "en"
+    },
+    "owner": {
+      "type": "string",
+      "title": "GitHub owner",
+      "description": "Organization or user whose self-hosted runners and repos to watch (e.g. my-org). You can also run /radar <owner>.",
+      "default": ""
+    },
+    "repos": {
+      "type": "string",
+      "title": "Repositories",
+      "description": "Comma-separated repo names to watch. Leave empty to watch the most recently pushed repos of the owner.",
+      "default": ""
+    },
+    "max_repos": {
+      "type": "number",
+      "title": "Max repos (auto mode)",
+      "description": "How many recently pushed repos to watch when Repositories is empty.",
+      "default": 6,
+      "min": 1,
+      "max": 20
+    },
+    "interval_seconds": {
+      "type": "number",
+      "title": "Refresh interval (seconds)",
+      "description": "How often to poll GitHub. Each refresh costs about one API call per repo plus one per active run.",
+      "default": 30,
+      "min": 15,
+      "max": 600
+    },
+    "queue_alert": {
+      "type": "number",
+      "title": "Queue alert (jobs)",
+      "description": "Toast when this many self-hosted jobs are waiting. 0 turns it off.",
+      "default": 5,
+      "min": 0,
+      "max": 100
+    },
+    "wait_alert_minutes": {
+      "type": "number",
+      "title": "Wait alert (minutes)",
+      "description": "Toast when a self-hosted job has been waiting this long. 0 turns it off.",
+      "default": 10,
+      "min": 0,
+      "max": 240
+    }
+  }
+}
