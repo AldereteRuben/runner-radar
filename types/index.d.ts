@@ -76,30 +76,42 @@ export type Snapshot = {
   runnerErrors: RunnerError[]
 }
 
+/** Why the hosted-equivalent counter stopped early, and until when (ms; 0 = next pass). */
+export type SavingsPause = { reason: 'rateLimit' | 'budget' | 'quota'; until: number }
+
 /**
- * One counted run, as kept in `$.store`: [repo, UTC day (YYYY-MM-DD),
- * self-hosted billable minutes, GitHub-hosted billable minutes].
+ * What the hosted-equivalent section shows: a hypothetical GitHub-hosted cost
+ * of the minutes that ran on self-hosted runners, computed from the stored scan.
  */
-export type UsageEntry = [string, string, number, number]
-
-/** Runs counted this month, by run id. */
-export type UsageMonth = Record<string, UsageEntry>
-
-/** What the savings section shows: computed from the stored month. */
 export type Savings = {
   owner: string
-  /** `YYYY-MM`, UTC: GitHub bills minutes in UTC. */
+  /** `YYYY-MM`, UTC. */
   month: string
   pricePerMinute: number
-  /** Billable minutes (each job rounded up to the minute) on your runners. */
+  /** Minutes (each job rounded up to the minute once) on your runners, by UTC job completion day. */
   monthMinutes: number
   todayMinutes: number
-  /** Minutes that still ran on GitHub-hosted runners this month. */
+  /** Minutes that ran on GitHub-hosted runners this month. */
   hostedMinutes: number
   perRepo: Array<{ repo: string; minutes: number }>
+  /** Runs whose every job page was fetched for their latest known attempt. */
   runsCounted: number
+  /** Finished runs (or new attempts) not counted yet. */
   runsPending: number
+  /** Runs still running: counted when they finish. */
+  runsRunning: number
+  /** `rebuilding` after the 0.3.0 cache was dropped, `catchingUp` while history or runs are left. */
+  coverage: 'complete' | 'catchingUp' | 'rebuilding'
+  /** `YYYY-MM-DD`: runs created since this day are covered. */
+  historyFrom: string
+  /** `YYYY-MM-DD`: how far back history is listed so far, while it is incomplete. */
+  scannedBack?: string
+  reposScanning: number
+  /** The last pass, successful or not. */
   updatedAt: number
+  /** The last pass without an error; 0 = never. */
+  lastSuccessAt: number
+  paused?: SavingsPause
   error?: ApiError
 }
 

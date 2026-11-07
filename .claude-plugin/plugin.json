@@ -1,8 +1,8 @@
 {
   "name": "runner-radar",
   "displayName": "Runner Radar",
-  "version": "0.3.0",
-  "description": "Live radar for your self-hosted GitHub Actions runners inside Claude Code: who is busy with what, what is waiting and why, what broke, and how much your runners saved you vs. GitHub-hosted minutes.",
+  "version": "0.3.1",
+  "description": "Live radar for your self-hosted GitHub Actions runners inside Claude Code: who is busy with what, what is waiting and why, what broke, and an estimated GitHub-hosted equivalent of the minutes your runners ran.",
   "author": {
     "name": "Ruben Alderete",
     "url": "https://github.com/AldereteRuben"
@@ -17,8 +17,8 @@
     "devops",
     "homelab",
     "mod",
-    "savings",
-    "cost"
+    "cost",
+    "estimate"
   ],
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -78,14 +78,14 @@
     },
     "savings": {
       "type": "boolean",
-      "title": "Savings counter",
-      "description": "Show how much your self-hosted runners saved this month vs. GitHub-hosted runners. Costs about one API call per new finished run, once.",
+      "title": "Hosted-equivalent estimate",
+      "description": "Show an estimated GitHub-hosted equivalent of this month's self-hosted minutes: hypothetical, not a bill or actual savings. Uses at most 30 API requests per pass and 150 per hour.",
       "default": true
     },
     "price_per_minute": {
       "type": "number",
-      "title": "GitHub-hosted price (USD/min)",
-      "description": "Per-minute price the savings counter compares against. 0.006 is GitHub-hosted Linux 2-core (2026); use 0.010 for Windows.",
+      "title": "Comparison rate (USD/min)",
+      "description": "Per-minute GitHub-hosted rate the estimate uses. 0.006 is standard Linux x64 2-core; check https://docs.github.com/en/billing/reference/actions-runner-pricing for other runner types.",
       "default": 0.006,
       "min": 0,
       "max": 1

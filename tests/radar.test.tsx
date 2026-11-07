@@ -78,11 +78,14 @@ function fakeGh(argv: readonly string[], failApiRunner = false): { exitCode: num
 
 type On = Parameters<Parameters<typeof test>[2]>[1]
 
+type GhResult = ReturnType<typeof fakeGh>
+
 function engine(
   on: On,
   toasts: string[] = [],
-  runGh: (argv: readonly string[]) => ReturnType<typeof fakeGh> = argv => fakeGh(argv),
+  runGh: (argv: readonly string[]) => GhResult | Promise<GhResult> = argv => fakeGh(argv),
   store: Map<string, unknown> = new Map(),
+  clock: () => number = () => NOW,
 ) {
   on('store.get', (_, e) => ({ value: store.get((e as { key: string }).key) }))
   on('store.set', (_, e) => {
@@ -102,12 +105,12 @@ function engine(
   on('ui.invalidate', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
   on('clock.every', () => ({ value: { cancel: () => {} } }))
-  on('clock.now', () => ({ value: NOW }))
+  on('clock.now', () => ({ value: clock() }))
   on('ui.toast', (_, e) => {
     toasts.push(String((e as { text: string }).text))
     return { value: undefined }
   })
-  on('process.run', (_, e) => ({ value: runGh((e as { argv: readonly string[] }).argv) }))
+  on('process.run', async (_, e) => ({ value: await runGh((e as { argv: readonly string[] }).argv) }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
 }
 
@@ -403,105 +406,553 @@ test('parseRepos accepts names and owner/name, trims and drops blanks', () => {
   expect(parseRepos('')).toEqual([])
 })
 
-// ── Savings ─────────────────────────────────────────────────────
+// ── Hosted-equivalent estimate ──────────────────────────────────
 
-import { billableMinutes } from '../hooks/github'
-import { dayKey, grouped, money, monthKey, readMonth, storeKey, summarize } from '../hooks/savings'
+import { cooldownEnd, freshLimiter, isRateLimited, pause, splitHead } from '../hooks/limiter'
+import {
+  addJob,
+  addJobsPage,
+  afterHead,
+  billableMinutes,
+  dayKey,
+  freshProgress,
+  freshRepo,
+  grouped,
+  isComplete,
+  money,
+  monthKey,
+  readRepo,
+  repoKey,
+  stepSegment,
+  summarize,
+  windowStart,
+} from '../hooks/savings'
 
-test('billable minutes round each job up, and a job that never ran is free', () => {
-  expect(billableMinutes(0)).toBe(0)
-  expect(billableMinutes(1)).toBe(1)
-  expect(billableMinutes(60)).toBe(1)
-  expect(billableMinutes(61)).toBe(2)
+type FJob = { a?: number; sh: boolean; st: string; ct: string }
+type FRun = { id: number; c: string; st?: string; a?: number; jobs: FJob[] }
+type Model = Record<string, FRun[]>
+
+/** A job that started at `start` and ran `seconds`. */
+const ran = (start: string, seconds: number, sh = true, a = 1): FJob => ({
+  a,
+  sh,
+  st: start,
+  ct: new Date(Date.parse(start) + seconds * 1000).toISOString(),
 })
 
-test('month and day keys are UTC, and the store key is per owner and month', () => {
+const ok = (v: unknown): GhResult => ({ exitCode: 0, stdout: JSON.stringify(v), stderr: '' })
+const ROUTE = /^repos\/acme\/([^/]+)\/actions\/runs(?:\?(.*)|\/(\d+)(?:\/jobs\?(.*))?)$/
+
+/** The counter's request paths, by kind; everything else goes to fakeGh (the radar). */
+function counterPath(path: string): RegExpExecArray | undefined {
+  const m = ROUTE.exec(path)
+  if (!m) return undefined
+  if (m[2] !== undefined) return m[2].includes('per_page=100') ? m : undefined
+  if (m[4] === undefined) return m
+  return m[4].includes('filter=all') ? m : undefined
+}
+
+/**
+ * A fake GitHub for the counter: runs newest first, `created` ranges and the
+ * 1,000-result cap, single runs, and job pages; `hook` can answer first.
+ */
+function github(
+  model: Model,
+  calls: string[],
+  hook?: (path: string) => GhResult | Promise<GhResult> | undefined,
+  radar: (argv: readonly string[]) => GhResult | Promise<GhResult> = fakeGh,
+) {
+  return async (argv: readonly string[]): Promise<GhResult> => {
+    const path = argv[2] ?? ''
+    const m = counterPath(path)
+    if (!m) return radar(argv)
+    calls.push(path)
+    const hooked = await hook?.(path)
+    if (hooked) return hooked
+    const runs = [...(model[m[1] ?? ''] ?? [])].sort((a, b) => Date.parse(b.c) - Date.parse(a.c))
+    const listed = (r: FRun) => ({ id: r.id, st: r.st ?? 'completed', a: r.a ?? 1, c: r.c })
+    if (m[2] !== undefined) {
+      const q = new URLSearchParams(m[2])
+      const page = Number(q.get('page') ?? 1)
+      let rs = runs
+      const created = q.get('created')
+      if (created) {
+        const [from, to] = created.split('..').map(x => Date.parse(x))
+        rs = page > 10 ? [] : rs.filter(r => Date.parse(r.c) >= (from ?? 0) && Date.parse(r.c) <= (to ?? 0))
+      }
+      return ok(rs.slice((page - 1) * 100, page * 100).map(listed))
+    }
+    const run = runs.find(r => r.id === Number(m[3]))
+    if (!run) return { exitCode: 1, stdout: '', stderr: 'HTTP 404: Not Found' }
+    if (m[4] === undefined) return ok(listed(run))
+    const page = Number(new URLSearchParams(m[4]).get('page') ?? 1)
+    return ok({ t: run.jobs.length, j: run.jobs.slice((page - 1) * 100, page * 100).map(j => ({ ...j, a: j.a ?? 1 })) })
+  }
+}
+
+const jobCalls = (calls: string[], id?: number) =>
+  calls.filter(c => c.includes('/jobs?filter=all') && (id === undefined || c.includes(`/runs/${id}/`)))
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+/**
+ * A store that notes the request count each time a counter pass ends (its
+ * last write), whoever started the pass: a command, a refresh or a catch-up.
+ */
+function passStore(calls: string[], entries: Array<[string, unknown]> = []) {
+  const ends: number[] = []
+  class PassMap extends Map<string, unknown> {
+    override set(key: string, value: unknown) {
+      if (key === 'scan2meta:acme') ends.push(calls.length)
+      return super.set(key, value)
+    }
+  }
+  const store = new PassMap(entries)
+  const perPass = () => ends.map((n, i) => n - (ends[i - 1] ?? 0))
+  return { store, perPass }
+}
+
+/** api: run 9 today (2+1 min here, 2 hosted) and run 8 on Nov 2 (10 min); web: run 20 (1 min). */
+const basicModel = (): Model => ({
+  api: [
+    { id: 9, c: iso(60 * MIN), jobs: [ran(iso(50 * MIN), 61), ran(iso(50 * MIN), 30), ran(iso(50 * MIN), 120, false)] },
+    { id: 8, c: '2026-11-02T10:00:00Z', jobs: [ran('2026-11-02T10:01:00Z', 600)] },
+  ],
+  web: [{ id: 20, c: iso(15 * MIN), jobs: [ran(iso(14 * MIN), 59)] }],
+})
+
+test('hosted equivalent: the pane and /radar savings show the month, today, repos and caveats', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  const store = new Map<string, unknown>()
+  engine(on, [], github(basicModel(), calls), store)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(150)
+
+  // 9: 2+1 min on your runners (+2 hosted) · 8: 10 min · 20: 1 min = 14 min, $0.084
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Hosted equivalent/ })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /≈/ }))?.text).toContain('≈ $0.08 estimated GitHub-hosted equivalent · 14 min on your runners')
+  expect((await ui.find({ type: 'Text', text: /^\s*today/ }))?.text).toContain('today $0.02 · 4 min')
+  expect((await ui.find({ type: 'Text', text: /api \$0\.08/ }))?.text).toContain('api $0.08 · web <$0.01')
+  expect(await ui.find({ type: 'Text', text: /all runs created since 2026-10-02 counted/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /public repos and included plan minutes may mean \$0 extra/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /last complete update/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /saved/ })).toBeUndefined()
+  await ui.unmount()
+
+  // Each run was fetched once and kept by owner and repo.
+  expect(jobCalls(calls).length).toBe(3)
+  expect(Object.keys(readRepo(store.get(repoKey('acme', 'api'))).runs).sort()).toEqual(['8', '9'])
+
+  const report = (await $.command.run({ command: 'radar', args: 'savings' })).text
+  expect(report).toContain('≈ $0.08 estimated GitHub-hosted equivalent · 14 minutes on your self-hosted runners')
+  expect(report).toContain('today: $0.02 · 4 min')
+  expect(report).toContain('2 min ran on GitHub-hosted runners')
+  expect(report).toContain('Comparison rate: $0.006/min')
+  expect(report).toContain('not a bill and not money you saved')
+  expect(report).toContain('free for public repositories')
+  expect(report).toContain("plan's included minutes")
+  expect(report).toContain('hardware, power and maintenance are not subtracted')
+  expect(report).toContain('may not perform like the selected hosted runner')
+  expect(report).toContain('assigned to the UTC day the job finished')
+  expect(report).toContain('at most 30 requests per pass and 150 per hour')
+  expect(report).not.toMatch(/\$[\d.]+ saved/)
+  // The second pass only lists the newest runs; nothing counted is fetched again.
+  expect(jobCalls(calls).length).toBe(3)
+})
+
+// Shared by the next two tests: the second one is a restart on the first one's store.
+const restartStore = new Map<string, unknown>()
+const rerunModel: Model = { api: [{ id: 9, c: iso(60 * MIN), jobs: [ran(iso(50 * MIN), 61), ran(iso(50 * MIN), 30)] }] }
+
+test('repeated passes never double count; a later attempt adds its minutes exactly once', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  engine(on, [], github(rerunModel, calls), restartStore)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(120)
+  const savings = async () => (await $.command.run({ command: 'radar', args: 'savings' })).text
+  for (let i = 0; i < 3; i++) expect(await savings()).toContain('· 3 minutes on your self-hosted runners')
+  expect(jobCalls(calls).length).toBe(1)
+
+  // Re-run: attempt 2 adds a 2m05s job (3 min). Attempt 1 is not counted again.
+  const run = rerunModel.api?.[0] as FRun
+  run.a = 2
+  run.jobs.push(ran(iso(5 * MIN), 125, true, 2))
+  expect(await savings()).toContain('· 6 minutes on your self-hosted runners')
+  for (let i = 0; i < 3; i++) expect(await savings()).toContain('· 6 minutes on your self-hosted runners')
+  expect(jobCalls(calls, 9).length).toBe(2)
+})
+
+test('after a restart the stored totals are reused, not fetched or added again', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  engine(on, [], github(rerunModel, calls), restartStore)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(120)
+  const report = (await $.command.run({ command: 'radar', args: 'savings' })).text
+  expect(report).toContain('· 6 minutes on your self-hosted runners')
+  expect(report).toContain('all runs created since 2026-10-02 counted')
+  expect(jobCalls(calls).length).toBe(0)
+})
+
+test('more than 300 runs are all counted over several passes, incomplete until then; the 0.3.0 cache is rebuilt', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  let now = NOW
+  const { store, perPass } = passStore(calls, [['usage:acme:2026-11', { '1': ['api', '2026-11-07', 10, 0] }]])
+  const runs: FRun[] = []
+  for (let i = 0; i < 350; i++) {
+    const c = new Date(NOW - i * 20 * MIN - 5 * MIN).toISOString()
+    runs.push({ id: 1000 + i, c, jobs: [ran(new Date(Date.parse(c) + MIN).toISOString(), 60)] })
+  }
+  engine(on, [], github({ api: runs }, calls), store, () => now)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(200)
+  expect(store.has('usage:acme:2026-11')).toBe(false)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /recalculating: 0\.3\.1 dates minutes/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /incomplete: totals grow/ })).toBeDefined()
+  await ui.unmount()
+
+  const reports: string[] = []
+  for (let pass = 0; pass < 40; pass++) {
+    now += 13 * MIN
+    const text = (await $.command.run({ command: 'radar', args: 'savings' })).text
+    reports.push(text)
+    if (text.includes('all runs created since')) break
+  }
+  expect(reports[0]).toContain('incomplete')
+  expect(reports.some(r => /counting runs… \d+ of 350/.test(r))).toBe(true)
+  expect(reports.slice(0, -1).every(r => !r.includes('all runs created since'))).toBe(true)
+  const last = reports[reports.length - 1] ?? ''
+  expect(last).toContain('≈ $2.10 estimated GitHub-hosted equivalent · 350 minutes')
+  expect(last).not.toContain('recalculating')
+  expect(Math.max(...perPass())).toBeLessThanOrEqual(30)
+  // Every run fetched exactly once.
+  expect(new Set(jobCalls(calls)).size).toBe(350)
+  expect(jobCalls(calls).length).toBe(350)
+})
+
+test('a run with more than 100 jobs over two attempts is counted in full; a failed page 2 never finalizes it', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  const start = iso(3 * 60 * MIN)
+  const jobs = [
+    ...Array.from({ length: 100 }, () => ran(start, 60, true, 1)),
+    ...Array.from({ length: 50 }, () => ran(iso(60 * MIN), 60, true, 2)),
+  ]
+  let failures = 0
+  engine(on, [], github({ api: [{ id: 30, c: start, a: 2, jobs }] }, calls, path => {
+    if (path.includes('/runs/30/jobs') && path.includes('page=2') && failures < 2) {
+      failures++
+      return { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway' }
+    }
+    return undefined
+  }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(150)
+
+  // Page 1 (100 jobs) counted nowhere yet; the failure and the gap are on screen.
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /≈/ }))?.text).toContain('≈ $0.00 estimated GitHub-hosted equivalent · 0 min')
+  expect(await ui.find({ type: 'Text', text: /last update failed: could not reach GitHub/ })).toBeDefined()
+  // Cut to the pane width: "incomplete: totals grow as history is counted · counting runs… 0 o…"
+  expect(await ui.find({ type: 'Text', text: /incomplete.*counting runs… 0/ })).toBeDefined()
+  await ui.unmount()
+
+  const en = (await $.command.run({ command: 'radar', args: 'savings' })).text
+  expect(en).toContain('· 0 minutes on your self-hosted runners')
+  expect(en).toContain('✖ last update failed: could not reach GitHub')
+  expect(en).toContain('⚠ incomplete: totals grow as history is counted · counting runs… 0 of 1')
+
+  await $.command.run({ command: 'radar', args: 'es' })
+  await sleep(80)
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Coste equivalente/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /falló la última actualización: no se pudo conectar con GitHub/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /incompleto: el total crece/ })).toBeDefined()
+  await ui.unmount()
+
+  const es = (await $.command.run({ command: 'radar', args: 'ahorro' })).text
+  expect(es).toContain('≈ $0.90 coste equivalente estimado · 150 minutos en tus runners self-hosted')
+  expect(es).toContain('contados todos los runs creados desde 2026-10-02')
+  expect(es).not.toContain('falló')
+  // Page 1 was kept and not fetched again; page 2 was retried until it worked.
+  expect(calls.filter(c => c.includes('/runs/30/jobs') && c.endsWith('page=1')).length).toBe(1)
+  expect(calls.filter(c => c.includes('/runs/30/jobs') && c.endsWith('page=2')).length).toBe(3)
+})
+
+test('the request budget holds across repeated /radar savings commands', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  const runs: FRun[] = Array.from({ length: 400 }, (_, i) => {
+    const c = new Date(NOW - i * 10 * MIN - MIN).toISOString()
+    return { id: 5000 + i, c, jobs: [ran(c, 30)] }
+  })
+  const { store, perPass } = passStore(calls)
+  engine(on, [], github({ api: runs }, calls), store)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(200)
+  let last = ''
+  for (let i = 0; i < 10; i++) last = (await $.command.run({ command: 'radar', args: 'savings' })).text
+  // At most 30 per pass and 150 per rolling hour: discovery, job pages, retries,
+  // catch-up and manual passes included.
+  expect(perPass().length).toBeGreaterThanOrEqual(10)
+  expect(Math.max(...perPass())).toBeLessThanOrEqual(30)
+  expect(calls.length).toBe(150)
+  expect(last).toContain('request budget used: continues after')
+  expect(last).toContain('incomplete')
+})
+
+test('a rate limit during discovery stops the pass and pauses the radar; a concurrent successful refresh keeps the pause', { options: { owner: 'acme', repos: 'api,web' } }, async ($, on) => {
+  const calls: string[] = []
+  const all: string[] = []
+  let now = NOW
+  let armed = false
+  let slowRadar = false
+  const radarGh = async (argv: readonly string[]) => {
+    if (slowRadar) await sleep(80)
+    // No active or failed runs: a refresh that succeeds with no follow-up request.
+    if (/\/actions\/runs\?per_page=20$/.test(argv[2] ?? '')) return ok([])
+    return fakeGh(argv)
+  }
+  engine(on, [], async argv => {
+    all.push(argv[2] ?? '')
+    return github({}, calls, async path => {
+      if (!armed || !path.startsWith('repos/acme/api/actions/runs?')) return undefined
+      await sleep(40)
+      return {
+        exitCode: 1,
+        stdout: 'HTTP/2.0 403 Forbidden\r\nRetry-After: 3600\r\nX-Ratelimit-Remaining: 4000\r\n\r\n{"message":"You have exceeded a secondary rate limit"}',
+        stderr: 'gh: You have exceeded a secondary rate limit (HTTP 403)',
+      }
+    }, radarGh)(argv)
+  }, new Map(), () => now)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(150)
+  // Headers are asked for on every API call, no separate quota request.
+  expect(all.length).toBeGreaterThan(0)
+
+  armed = true
+  slowRadar = true
+  const before = calls.length
+  const pass = $.command.run({ command: 'radar', args: 'savings' })
+  await sleep(5)
+  await $.command.run({ command: 'radar', args: 'refresh' }) // radar requests now in flight
+  const report = (await pass).text
+  await sleep(150) // the radar refresh finishes successfully after the rate limit
+  expect(calls.length - before).toBe(1) // web's discovery was never requested
+  expect(report).toContain('paused by a GitHub rate limit until')
+  expect(report).toContain('last update failed: GitHub API rate limit reached')
+
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /paused by a GitHub rate limit/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /GitHub API rate limit reached/ })).toBeDefined()
+  await ui.unmount()
+
+  // The successful refresh did not end the cooldown: Retry-After (1 hour) holds.
+  slowRadar = false
+  const held = all.length
+  now += 61_000
+  await $.command.run({ command: 'radar', args: 'refresh' })
+  await sleep(40)
+  now += 20 * MIN
+  const stale = (await $.command.run({ command: 'radar', args: 'savings' })).text
+  expect(all.length).toBe(held)
+  expect(stale).toContain('not updating · last complete update')
+  expect(stale).toContain('paused by a GitHub rate limit')
+  await $.command.run({ command: 'radar', args: 'es' })
+  await sleep(40)
+  const staleEs = (await $.command.run({ command: 'radar', args: 'ahorro' })).text
+  expect(staleEs).toContain('sin actualizar · última actualización completa')
+  expect(staleEs).toContain('en pausa por el límite de la API de GitHub')
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /sin actualizar · última actualización completa/ })).toBeDefined()
+  await ui.unmount()
+  expect(all.length).toBe(held)
+
+  // After Retry-After, requests resume.
+  now = NOW + 3_601_000
+  armed = false
+  await $.command.run({ command: 'radar', args: 'refresh' })
+  await sleep(80)
+  expect(all.length).toBeGreaterThan(held)
+})
+
+test('passes never overlap, and an owner change mid-pass publishes nothing stale and does not resume', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  let slow = false
+  // Small enough to finish within the hourly budget before the checks below.
+  const runs: FRun[] = Array.from({ length: 20 }, (_, i) => {
+    const c = new Date(NOW - i * 10 * MIN - MIN).toISOString()
+    return { id: 7000 + i, c, jobs: [ran(c, 30)] }
+  })
+  engine(on, [], github({ api: runs }, calls, async () => {
+    if (slow) await sleep(30)
+    return undefined
+  }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(200)
+
+  // Two commands at once share one pass: the newest page is listed once.
+  const heads = () => calls.filter(c => c === 'repos/acme/api/actions/runs?per_page=100&page=1').length
+  const before = heads()
+  await Promise.all([
+    $.command.run({ command: 'radar', args: 'savings' }),
+    $.command.run({ command: 'radar', args: 'savings' }),
+  ])
+  expect(heads() - before).toBe(1)
+
+  // Switch owner while a slow pass is in flight.
+  slow = true
+  const pass = $.command.run({ command: 'radar', args: 'savings' })
+  await sleep(10)
+  await $.command.run({ command: 'radar', args: 'beta' })
+  const atSwitch = calls.length
+  await pass
+  await sleep(150)
+  // The request in flight finished; no further acme request, no catch-up.
+  const after = calls.length
+  expect(after).toBe(atSwitch)
+  // Nothing of acme is shown as beta's.
+  expect((await $.command.run({ command: 'radar', args: 'savings' })).text).not.toContain('estimated GitHub-hosted equivalent ·')
+  expect(calls.length).toBe(after)
+})
+
+test('minutes are dated by job completion in UTC: midnight, month end, and an old run re-run this month', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  engine(on, [], github({
+    api: [
+      // Created Oct 20, re-run today: only attempt 2 (3 min) is in November.
+      { id: 50, c: '2026-10-20T10:00:00Z', a: 2, jobs: [ran('2026-10-20T10:01:00Z', 600, true, 1), ran(iso(30 * MIN), 180, true, 2)] },
+      // Created Oct 31 before midnight, finished in November: 10 min, all in November.
+      { id: 51, c: '2026-10-31T23:50:00Z', jobs: [ran('2026-10-31T23:55:00Z', 600)] },
+      // Created before the window: never looked at.
+      { id: 52, c: '2026-09-20T10:00:00Z', jobs: [ran('2026-09-20T10:00:00Z', 600)] },
+    ],
+  }, calls))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await sleep(150)
+  const report = (await $.command.run({ command: 'radar', args: 'savings' })).text
+  expect(report).toContain('· 13 minutes on your self-hosted runners')
+  expect(report).toContain('today: $0.02 · 3 min')
+  expect(jobCalls(calls, 52).length).toBe(0)
+  expect(jobCalls(calls).length).toBe(2)
+})
+
+test('UTC day attribution rounds each job once and never splits it', () => {
+  const d = {}
+  // 70 s across midnight: 2 min, all on the day it finished.
+  addJob(d, { a: 1, sh: true, st: '2026-11-07T23:59:30Z', ct: '2026-11-08T00:00:40Z' })
+  // 3m30s across the month end: 4 min, all in November.
+  addJob(d, { a: 1, sh: true, st: '2026-10-31T23:58:00Z', ct: '2026-11-01T00:01:30Z' })
+  // Never started: nothing.
+  addJob(d, { a: 1, sh: true, st: null, ct: '2026-11-01T00:01:30Z' })
+  addJob(d, { a: 1, sh: false, st: '2026-11-07T10:00:00Z', ct: '2026-11-07T10:00:01Z' })
+  expect(d).toEqual({ '2026-11-08': [2, 0], '2026-11-01': [4, 0], '2026-11-07': [0, 1] })
+  const total = Object.values(d as Record<string, [number, number]>).reduce((s, [a, b]) => s + a + b, 0)
+  expect(total).toBe(billableMinutes(70) + billableMinutes(210) + billableMinutes(1))
+})
+
+test('job pages: a changed job count restarts the fetch; a short page ends it', () => {
+  const p = freshProgress(1)
+  const job = ran('2026-11-07T10:00:00Z', 60)
+  expect(addJobsPage(p, { total: 150, jobs: Array(100).fill(job) })).toBe('more')
+  expect(addJobsPage(p, { total: 160, jobs: Array(50).fill(job) })).toBe('restart')
+  const q = freshProgress(1)
+  addJobsPage(q, { total: 150, jobs: Array(100).fill(job) })
+  expect(addJobsPage(q, { total: 150, jobs: Array(50).fill(job) })).toBe('done')
+  expect(q.d).toEqual({ '2026-11-07': [150, 0] })
+})
+
+test('history scans resume from a stored cursor and narrow the range past 1,000 results', () => {
+  const win = windowStart(NOW)
+  const state = freshRepo()
+  const page = (from: number) =>
+    Array.from({ length: 100 }, (_, i) => ({ id: from + i, st: 'completed', a: 1, c: NOW - (from + i) * MIN }))
+  afterHead(state, page(0), win, NOW)
+  expect(state.segs).toEqual([{ from: win, to: NOW - 99 * MIN, page: 1 }])
+  expect(isComplete(state, win)).toBe(false)
+  const seg = state.segs[0]
+  if (!seg) throw new Error('no segment')
+  seg.page = 10
+  stepSegment(state, seg, page(1000), win, NOW)
+  expect(seg).toMatchObject({ page: 1, to: NOW - 1099 * MIN })
+  // A stored state survives a round trip; malformed parts are dropped.
+  const back = readRepo(JSON.parse(JSON.stringify({ ...state, runs: { ...state.runs, x: { c: 'bad' } } })))
+  expect(back.segs).toEqual(state.segs)
+  expect(Object.keys(back.runs).length).toBe(Object.keys(state.runs).length)
+  stepSegment(state, seg, page(1100).slice(0, 10), win, NOW)
+  expect(state.segs).toEqual([])
+  expect(isComplete(state, win)).toBe(true)
+})
+
+test('rate-limit headers: retry-after, then the reset time, else a minute; a pause is never shortened', () => {
+  const head = (h: string) => splitHead(`HTTP/2.0 403 Forbidden\r\n${h}\r\n\r\n{"message":"x"}`).head
+  expect(splitHead('HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 4999\r\n\r\n[1,2]')).toEqual({
+    head: { status: 200, headers: { 'x-ratelimit-remaining': '4999' } },
+    body: '[1,2]',
+  })
+  expect(splitHead('[1,2]')).toEqual({ body: '[1,2]' })
+  expect(cooldownEnd(head('Retry-After: 120'), NOW)).toBe(NOW + 120_000)
+  const reset = Math.floor(NOW / 1000) + 600
+  expect(cooldownEnd(head(`X-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: ${reset}`), NOW)).toBe(reset * 1000 + 1000)
+  expect(cooldownEnd(undefined, NOW)).toBe(NOW + 60_000)
+  expect(isRateLimited('HTTP 403', head('X-Ratelimit-Remaining: 0'))).toBe(true)
+  expect(isRateLimited('HTTP 403: Forbidden', head('X-Ratelimit-Remaining: 12'))).toBe(false)
+  expect(isRateLimited('HTTP 429', undefined)).toBe(true)
+  const limiter = freshLimiter()
+  pause(limiter, NOW + 300_000)
+  pause(limiter, NOW + 60_000)
+  expect(limiter.until).toBe(NOW + 300_000)
+})
+
+test('summaries: month keys are UTC, money and grouping', () => {
   expect(monthKey(NOW)).toBe('2026-11')
   expect(dayKey(Date.UTC(2026, 10, 30, 23, 59))).toBe('2026-11-30')
-  expect(storeKey('Acme', '2026-11')).toBe('usage:acme:2026-11')
-})
-
-test('summarize totals the month, today and repos; malformed store data is dropped', () => {
-  const usage = readMonth({
-    '1': ['api', '2026-11-07', 10, 0],
-    '2': ['api', '2026-11-02', 5, 3],
-    '3': ['web', '2026-11-07', 2, 0],
-    bad: ['web', 7, 'x', 0],
-  })
-  expect(Object.keys(usage)).toEqual(['1', '2', '3'])
-  const s = summarize(usage, { owner: 'acme', month: '2026-11', today: '2026-11-07', pricePerMinute: 0.006, runsPending: 4, updatedAt: NOW })
-  expect(s.monthMinutes).toBe(17)
-  expect(s.todayMinutes).toBe(12)
-  expect(s.hostedMinutes).toBe(3)
-  expect(s.perRepo).toEqual([{ repo: 'api', minutes: 15 }, { repo: 'web', minutes: 2 }])
-  expect(s.runsCounted).toBe(3)
+  expect(dayKey(windowStart(NOW))).toBe('2026-10-02')
   expect(money(6400, 0.006)).toBe('$38.40')
   expect(money(1, 0.006)).toBe('<$0.01')
   expect(grouped(6400, ',')).toBe('6,400')
   expect(grouped(1228, '.')).toBe('1.228')
+  const state = freshRepo()
+  state.runs['1'] = { c: NOW, a: 1, st: 'completed', k: NOW, f: true, d: { '2026-11-07': [10, 2], '2026-10-30': [99, 0] } }
+  state.runs['2'] = { c: NOW, a: 1, st: 'in_progress', k: NOW, f: false }
+  const s = summarize([{ repo: 'api', state }], {
+    owner: 'acme',
+    now: NOW,
+    pricePerMinute: 0.006,
+    meta: { v: 2, log: [], ok: NOW, rebuilding: false },
+    updatedAt: NOW,
+  })
+  expect(s).toMatchObject({ monthMinutes: 10, todayMinutes: 10, hostedMinutes: 2, runsCounted: 1, runsRunning: 1, coverage: 'catchingUp' })
 })
 
-/** fakeGh plus the savings calls: this month's completed runs and their jobs' minutes. */
-function savingsGh(calls: string[]) {
-  return (argv: readonly string[]) => {
-    const path = argv[2] ?? ''
-    const ok = (v: unknown) => ({ exitCode: 0, stdout: JSON.stringify(v), stderr: '' })
-    if (path.includes('status=completed')) {
-      calls.push(`list ${path.split('/')[2]}`)
-      if (path.startsWith('repos/acme/api/')) {
-        return ok([
-          { id: 9, created_at: iso(60 * MIN) },
-          { id: 8, created_at: '2026-11-02T10:00:00Z' },
-        ])
-      }
-      if (path.startsWith('repos/acme/web/')) return ok([{ id: 20, created_at: iso(15 * MIN) }])
-      return ok([])
-    }
-    const minutes = /runs\/(\d+)\/jobs\?filter=all/.exec(path)
-    if (minutes) {
-      calls.push(`jobs ${minutes[1]}`)
-      const byRun: Record<string, Array<{ sh: boolean; s: number }>> = {
-        '9': [{ sh: true, s: 61 }, { sh: true, s: 30 }, { sh: false, s: 120 }],
-        '8': [{ sh: true, s: 600 }],
-        '20': [{ sh: true, s: 59 }],
-      }
-      return ok(byRun[minutes[1] ?? ''] ?? [])
-    }
-    return fakeGh(argv)
-  }
-}
-
-test('savings: the pane and /radar savings show the month, today and repos', { options: { owner: 'acme' } }, async ($, on) => {
-  const calls: string[] = []
-  const store = new Map<string, unknown>()
-  engine(on, [], savingsGh(calls), store)
+test('the estimate in Spanish, and off when the option says so', { options: { owner: 'acme', savings: false } }, async ($, on) => {
+  engine(on, [], github(basicModel(), []))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.command.run({ command: 'radar', args: '' })
-  await new Promise(resolve => setTimeout(resolve, 120))
-
-  // 9: 2+1 min on your runners (+2 hosted) · 8: 10 min · 20: 1 min = 14 min, $0.084
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /💰/ }))?.text).toContain('💰 $0.08 saved · 14 min on your runners')
-  expect((await ui.find({ type: 'Text', text: /^\s*today/ }))?.text).toContain('today $0.02 · 4 min')
-  expect((await ui.find({ type: 'Text', text: /api \$0\.08/ }))?.text).toContain('api $0.08 · web <$0.01')
-  await ui.unmount()
-
-  // Each run was looked up once and kept by run id for the month.
-  expect(calls.filter(c => c.startsWith('jobs')).sort()).toEqual(['jobs 20', 'jobs 8', 'jobs 9'])
-  expect(Object.keys(store.get('usage:acme:2026-11') as object).sort()).toEqual(['20', '8', '9'])
-
-  const report = (await $.command.run({ command: 'radar', args: 'savings' })).text
-  expect(report).toContain('$0.08 saved · 14 billable minutes on your self-hosted runners')
-  expect(report).toContain('today: $0.02 · 4 min')
-  expect(report).toContain('2 min still ran on GitHub-hosted runners')
-  expect(report).toContain('Price: $0.006/min')
-  // The second pass only lists runs; nothing counted before is looked up again.
-  expect(calls.filter(c => c.startsWith('jobs')).length).toBe(3)
+  expect((await $.command.run({ command: 'radar', args: 'ahorro' })).text).toContain('estimate is off')
+  expect(es.savings.total('$7.37', grouped(1228, es.savings.thousands))).toBe('≈ $7.37 coste equivalente estimado en GitHub · 1.228 min en tus runners')
+  expect(es.savings.caveat).toContain('repos públicos')
 })
 
-test('savings in Spanish, and off when the option says so', { options: { owner: 'acme', savings: false } }, async ($, on) => {
-  engine(on, [], savingsGh([]))
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  expect((await $.command.run({ command: 'radar', args: 'ahorro' })).text).toContain('savings counter is off')
-  expect(es.savings.total('$7.37', grouped(1228, es.savings.thousands))).toBe('💰 $7.37 ahorrados · 1.228 min en tus runners')
+
+test('an unchanged busy head does not rediscover a completed history window', () => {
+  const state = freshRepo()
+  const win = windowStart(NOW)
+  const runs = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, st: 'completed', a: 1, c: NOW - i * 100 }))
+  afterHead(state, runs, win, NOW)
+  const seg = state.segs[0]
+  if (!seg) throw new Error('missing initial history segment')
+  stepSegment(state, seg, [], win, NOW)
+  expect(isComplete(state, win)).toBe(true)
+  afterHead(state, runs, win, NOW + MIN)
+  expect(state.segs).toEqual([])
+  expect(isComplete(state, win)).toBe(true)
 })

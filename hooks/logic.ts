@@ -25,7 +25,7 @@ export const isActive = (status: string): boolean => isPending(status) || status
 /** Sorts gh's error text into a kind the pane can explain in plain words. */
 export function classify(raw: string): ErrorKind {
   const s = raw.toLowerCase()
-  if (/rate limit|secondary rate|abuse detection/.test(s)) return 'rateLimit'
+  if (/rate limit|secondary rate|abuse detection|http 429/.test(s)) return 'rateLimit'
   if (/gh cli not found|enoent|executable file not found/.test(s)) return 'ghMissing'
   if (/http 401|bad credentials|gh auth login|not logged in|authentication required/.test(s)) return 'auth'
   if (/http 403|forbidden|must have admin|resource not accessible/.test(s)) return 'forbidden'
