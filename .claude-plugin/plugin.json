@@ -1,20 +1,35 @@
 {
   "name": "runner-radar",
   "displayName": "Runner Radar",
-  "version": "0.2.0",
-  "description": "Live radar for your self-hosted GitHub Actions runners inside Claude Code: who is busy with what, what is waiting in the queue and for how long, across all your repos.",
-  "author": { "name": "Ruben Alderete", "url": "https://github.com/AldereteRuben" },
+  "version": "0.3.0",
+  "description": "Live radar for your self-hosted GitHub Actions runners inside Claude Code: who is busy with what, what is waiting and why, what broke, and how much your runners saved you vs. GitHub-hosted minutes.",
+  "author": {
+    "name": "Ruben Alderete",
+    "url": "https://github.com/AldereteRuben"
+  },
   "homepage": "https://github.com/AldereteRuben/runner-radar",
   "repository": "https://github.com/AldereteRuben/runner-radar",
   "license": "MIT",
-  "keywords": ["github-actions", "self-hosted-runners", "ci", "devops", "homelab", "mod"],
+  "keywords": [
+    "github-actions",
+    "self-hosted-runners",
+    "ci",
+    "devops",
+    "homelab",
+    "mod",
+    "savings",
+    "cost"
+  ],
   "types": "./types/index.d.ts",
   "userConfig": {
     "language": {
       "type": "string",
       "title": "Language",
       "description": "Language of the pane, status line and alerts: en (English) or es (Español). /radar es or /radar en switches it for the session.",
-      "options": ["en", "es"],
+      "options": [
+        "en",
+        "es"
+      ],
       "default": "en"
     },
     "owner": {
@@ -60,6 +75,20 @@
       "default": 10,
       "min": 0,
       "max": 240
+    },
+    "savings": {
+      "type": "boolean",
+      "title": "Savings counter",
+      "description": "Show how much your self-hosted runners saved this month vs. GitHub-hosted runners. Costs about one API call per new finished run, once.",
+      "default": true
+    },
+    "price_per_minute": {
+      "type": "number",
+      "title": "GitHub-hosted price (USD/min)",
+      "description": "Per-minute price the savings counter compares against. 0.006 is GitHub-hosted Linux 2-core (2026); use 0.010 for Windows.",
+      "default": 0.006,
+      "min": 0,
+      "max": 1
     }
   }
 }

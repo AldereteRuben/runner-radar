@@ -76,11 +76,39 @@ export type Snapshot = {
   runnerErrors: RunnerError[]
 }
 
+/**
+ * One counted run, as kept in `$.store`: [repo, UTC day (YYYY-MM-DD),
+ * self-hosted billable minutes, GitHub-hosted billable minutes].
+ */
+export type UsageEntry = [string, string, number, number]
+
+/** Runs counted this month, by run id. */
+export type UsageMonth = Record<string, UsageEntry>
+
+/** What the savings section shows: computed from the stored month. */
+export type Savings = {
+  owner: string
+  /** `YYYY-MM`, UTC: GitHub bills minutes in UTC. */
+  month: string
+  pricePerMinute: number
+  /** Billable minutes (each job rounded up to the minute) on your runners. */
+  monthMinutes: number
+  todayMinutes: number
+  /** Minutes that still ran on GitHub-hosted runners this month. */
+  hostedMinutes: number
+  perRepo: Array<{ repo: string; minutes: number }>
+  runsCounted: number
+  runsPending: number
+  updatedAt: number
+  error?: ApiError
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'runner-radar': {
       snapshot: Shaped<Snapshot | null>
       polling: Shaped<boolean>
+      savings: Shaped<Savings | null>
     }
   }
 }

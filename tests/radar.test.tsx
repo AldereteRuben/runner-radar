@@ -78,7 +78,24 @@ function fakeGh(argv: readonly string[], failApiRunner = false): { exitCode: num
 
 type On = Parameters<Parameters<typeof test>[2]>[1]
 
-function engine(on: On, toasts: string[] = [], runGh: (argv: readonly string[]) => ReturnType<typeof fakeGh> = argv => fakeGh(argv)) {
+function engine(
+  on: On,
+  toasts: string[] = [],
+  runGh: (argv: readonly string[]) => ReturnType<typeof fakeGh> = argv => fakeGh(argv),
+  store: Map<string, unknown> = new Map(),
+) {
+  on('store.get', (_, e) => ({ value: store.get((e as { key: string }).key) }))
+  on('store.set', (_, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    store.set(key, JSON.parse(JSON.stringify(value)))
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    store.delete((e as { key: string }).key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('clock.after', () => ({ value: undefined }))
   on('command.register', () => ({ value: { command: 'radar' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.close', () => ({ value: undefined }))
@@ -384,4 +401,107 @@ test('headline: all good, a warning on a long wait, bad when a job cannot start'
 test('parseRepos accepts names and owner/name, trims and drops blanks', () => {
   expect(parseRepos(' api, acme/web ,, ')).toEqual(['api', 'web'])
   expect(parseRepos('')).toEqual([])
+})
+
+// ── Savings ─────────────────────────────────────────────────────
+
+import { billableMinutes } from '../hooks/github'
+import { dayKey, grouped, money, monthKey, readMonth, storeKey, summarize } from '../hooks/savings'
+
+test('billable minutes round each job up, and a job that never ran is free', () => {
+  expect(billableMinutes(0)).toBe(0)
+  expect(billableMinutes(1)).toBe(1)
+  expect(billableMinutes(60)).toBe(1)
+  expect(billableMinutes(61)).toBe(2)
+})
+
+test('month and day keys are UTC, and the store key is per owner and month', () => {
+  expect(monthKey(NOW)).toBe('2026-11')
+  expect(dayKey(Date.UTC(2026, 10, 30, 23, 59))).toBe('2026-11-30')
+  expect(storeKey('Acme', '2026-11')).toBe('usage:acme:2026-11')
+})
+
+test('summarize totals the month, today and repos; malformed store data is dropped', () => {
+  const usage = readMonth({
+    '1': ['api', '2026-11-07', 10, 0],
+    '2': ['api', '2026-11-02', 5, 3],
+    '3': ['web', '2026-11-07', 2, 0],
+    bad: ['web', 7, 'x', 0],
+  })
+  expect(Object.keys(usage)).toEqual(['1', '2', '3'])
+  const s = summarize(usage, { owner: 'acme', month: '2026-11', today: '2026-11-07', pricePerMinute: 0.006, runsPending: 4, updatedAt: NOW })
+  expect(s.monthMinutes).toBe(17)
+  expect(s.todayMinutes).toBe(12)
+  expect(s.hostedMinutes).toBe(3)
+  expect(s.perRepo).toEqual([{ repo: 'api', minutes: 15 }, { repo: 'web', minutes: 2 }])
+  expect(s.runsCounted).toBe(3)
+  expect(money(6400, 0.006)).toBe('$38.40')
+  expect(money(1, 0.006)).toBe('<$0.01')
+  expect(grouped(6400, ',')).toBe('6,400')
+  expect(grouped(1228, '.')).toBe('1.228')
+})
+
+/** fakeGh plus the savings calls: this month's completed runs and their jobs' minutes. */
+function savingsGh(calls: string[]) {
+  return (argv: readonly string[]) => {
+    const path = argv[2] ?? ''
+    const ok = (v: unknown) => ({ exitCode: 0, stdout: JSON.stringify(v), stderr: '' })
+    if (path.includes('status=completed')) {
+      calls.push(`list ${path.split('/')[2]}`)
+      if (path.startsWith('repos/acme/api/')) {
+        return ok([
+          { id: 9, created_at: iso(60 * MIN) },
+          { id: 8, created_at: '2026-11-02T10:00:00Z' },
+        ])
+      }
+      if (path.startsWith('repos/acme/web/')) return ok([{ id: 20, created_at: iso(15 * MIN) }])
+      return ok([])
+    }
+    const minutes = /runs\/(\d+)\/jobs\?filter=all/.exec(path)
+    if (minutes) {
+      calls.push(`jobs ${minutes[1]}`)
+      const byRun: Record<string, Array<{ sh: boolean; s: number }>> = {
+        '9': [{ sh: true, s: 61 }, { sh: true, s: 30 }, { sh: false, s: 120 }],
+        '8': [{ sh: true, s: 600 }],
+        '20': [{ sh: true, s: 59 }],
+      }
+      return ok(byRun[minutes[1] ?? ''] ?? [])
+    }
+    return fakeGh(argv)
+  }
+}
+
+test('savings: the pane and /radar savings show the month, today and repos', { options: { owner: 'acme' } }, async ($, on) => {
+  const calls: string[] = []
+  const store = new Map<string, unknown>()
+  engine(on, [], savingsGh(calls), store)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await new Promise(resolve => setTimeout(resolve, 120))
+
+  // 9: 2+1 min on your runners (+2 hosted) · 8: 10 min · 20: 1 min = 14 min, $0.084
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /💰/ }))?.text).toContain('💰 $0.08 saved · 14 min on your runners')
+  expect((await ui.find({ type: 'Text', text: /^\s*today/ }))?.text).toContain('today $0.02 · 4 min')
+  expect((await ui.find({ type: 'Text', text: /api \$0\.08/ }))?.text).toContain('api $0.08 · web <$0.01')
+  await ui.unmount()
+
+  // Each run was looked up once and kept by run id for the month.
+  expect(calls.filter(c => c.startsWith('jobs')).sort()).toEqual(['jobs 20', 'jobs 8', 'jobs 9'])
+  expect(Object.keys(store.get('usage:acme:2026-11') as object).sort()).toEqual(['20', '8', '9'])
+
+  const report = (await $.command.run({ command: 'radar', args: 'savings' })).text
+  expect(report).toContain('$0.08 saved · 14 billable minutes on your self-hosted runners')
+  expect(report).toContain('today: $0.02 · 4 min')
+  expect(report).toContain('2 min still ran on GitHub-hosted runners')
+  expect(report).toContain('Price: $0.006/min')
+  // The second pass only lists runs; nothing counted before is looked up again.
+  expect(calls.filter(c => c.startsWith('jobs')).length).toBe(3)
+})
+
+test('savings in Spanish, and off when the option says so', { options: { owner: 'acme', savings: false } }, async ($, on) => {
+  engine(on, [], savingsGh([]))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect((await $.command.run({ command: 'radar', args: 'ahorro' })).text).toContain('savings counter is off')
+  expect(es.savings.total('$7.37', grouped(1228, es.savings.thousands))).toBe('💰 $7.37 ahorrados · 1.228 min en tus runners')
 })

@@ -62,6 +62,30 @@ export type Strings = {
     queue: (n: number) => string
     longWait: (repo: string, job: string, wait: string) => string
   }
+  savings: {
+    title: string
+    summary: string
+    total: (amount: string, minutes: string) => string
+    today: (amount: string, minutes: string) => string
+    price: (price: string) => string
+    counting: (done: number, total: number) => string
+    hosted: (minutes: string) => string
+    none: string
+    /** Thousands separator: `6,400` / `6.400`. */
+    thousands: string
+    report: (r: {
+      month: string
+      total: string
+      minutes: string
+      today: string
+      todayMinutes: string
+      perRepo: string[]
+      hosted: string
+      price: string
+      counting: string
+    }) => string
+    off: string
+  }
   cmd: {
     stopped: string
     badOwner: (arg: string) => string
@@ -145,6 +169,34 @@ const en: Strings = {
     backOnline: name => `Runner ${name} is back online`,
     queue: n => `${n} jobs waiting for a runner`,
     longWait: (repo, job, wait) => `${repo} › ${job} has waited ${wait} for a runner`,
+  },
+  savings: {
+    title: 'Savings',
+    summary: 'this month (UTC) vs. GitHub-hosted runners',
+    total: (amount, minutes) => `💰 ${amount} saved · ${minutes} min on your runners`,
+    today: (amount, minutes) => `today ${amount} · ${minutes} min`,
+    price: price => `at ${price}/min, the GitHub-hosted Linux rate · /radar savings for details`,
+    counting: (done, total) => `counting runs… ${done} of ${total}`,
+    hosted: minutes => `${minutes} min still ran on GitHub-hosted runners`,
+    none: 'No jobs on your runners yet this month.',
+    thousands: ',',
+    report: r =>
+      [
+        `Runner Radar savings · ${r.month} (UTC)`,
+        '',
+        `${r.total} saved · ${r.minutes} billable minutes on your self-hosted runners`,
+        `today: ${r.today} · ${r.todayMinutes} min`,
+        '',
+        ...r.perRepo,
+        '',
+        r.hosted,
+        `Price: ${r.price}/min (GitHub-hosted Linux 2-core). Change it in /plugin → runner-radar → Configure.`,
+        'How: every job on a self-hosted runner, each rounded up to the whole minute and every re-run counted, as GitHub bills hosted runners. Self-hosted minutes themselves are free on GitHub today.',
+        r.counting,
+      ]
+        .filter((line, i, all) => line !== '' || (all[i - 1] ?? '') !== '')
+        .join('\n'),
+    off: 'The savings counter is off (Savings counter option in /plugin → runner-radar → Configure).',
   },
   cmd: {
     stopped: 'Runner Radar stopped: no more GitHub polling.',
@@ -238,6 +290,34 @@ const es: Strings = {
     backOnline: name => `El runner ${name} volvió a conectarse`,
     queue: n => `${n} jobs esperando un runner`,
     longWait: (repo, job, wait) => `${repo} › ${job} lleva ${wait} esperando un runner`,
+  },
+  savings: {
+    title: 'Ahorro',
+    summary: 'este mes (UTC) frente a los runners de GitHub',
+    total: (amount, minutes) => `💰 ${amount} ahorrados · ${minutes} min en tus runners`,
+    today: (amount, minutes) => `hoy ${amount} · ${minutes} min`,
+    price: price => `a ${price}/min, la tarifa de Linux en GitHub · /radar ahorro para el detalle`,
+    counting: (done, total) => `contando runs… ${done} de ${total}`,
+    hosted: minutes => `${minutes} min siguieron corriendo en runners de GitHub`,
+    none: 'Todavía no hay jobs en tus runners este mes.',
+    thousands: '.',
+    report: r =>
+      [
+        `Ahorro de Runner Radar · ${r.month} (UTC)`,
+        '',
+        `${r.total} ahorrados · ${r.minutes} minutos facturables en tus runners self-hosted`,
+        `hoy: ${r.today} · ${r.todayMinutes} min`,
+        '',
+        ...r.perRepo,
+        '',
+        r.hosted,
+        `Precio: ${r.price}/min (Linux de 2 núcleos en GitHub). Cámbialo en /plugin → runner-radar → Configure.`,
+        'Cálculo: cada job en un runner self-hosted, redondeado al minuto y contando cada reintento, como cobra GitHub sus runners. Los minutos self-hosted hoy son gratis en GitHub.',
+        r.counting,
+      ]
+        .filter((line, i, all) => line !== '' || (all[i - 1] ?? '') !== '')
+        .join('\n'),
+    off: 'El contador de ahorro está apagado (opción Savings counter en /plugin → runner-radar → Configure).',
   },
   cmd: {
     stopped: 'Runner Radar detenido: ya no consulta GitHub.',

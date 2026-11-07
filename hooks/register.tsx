@@ -1,8 +1,18 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { FailedJob, Snapshot } from '../types'
-import { failedLog, listRepos, listRunners, ownerKind, scanRepo } from './github'
+import type { ApiError, FailedJob, Savings, Snapshot } from '../types'
+import { completedRuns, failedLog, listRepos, listRunners, ownerKind, runMinutes, scanRepo } from './github'
+import {
+  DEFAULT_PRICE_PER_MINUTE,
+  dayKey,
+  grouped,
+  money,
+  monthKey,
+  readMonth,
+  storeKey,
+  summarize,
+} from './savings'
 import { type Lang, parseLang, type Strings, strings } from './i18n'
 import {
   type AlertMemory,
@@ -38,6 +48,14 @@ const COMMAND = 'radar'
 // version stored, which outlives a reload.
 const snapshot = atom({ plugin: 'runner-radar', key: 'snapshot' } as const, null, { shape: 'snapshot-3' })
 const polling = atom({ plugin: 'runner-radar', key: 'polling' } as const, false, { shape: 'polling-1' })
+const savingsAtom = atom({ plugin: 'runner-radar', key: 'savings' } as const, null, { shape: 'savings-1' })
+
+/** A savings pass runs this often: minutes of finished runs don't change. */
+const SAVINGS_EVERY_MS = 5 * 60_000
+/** While runs are left to count, the next pass comes this soon. */
+const SAVINGS_CATCH_UP_MS = 60_000
+/** Runs looked up per pass: the first month's backlog fills in over a few passes. */
+const SAVINGS_RUNS_PER_PASS = 25
 
 type Config = {
   owner: string
@@ -47,6 +65,8 @@ type Config = {
   queueAlert: number
   waitAlertMinutes: number
   lang: Lang
+  savingsOn: boolean
+  pricePerMinute: number
 }
 
 const num = (v: unknown, fallback: number, min: number, max: number): number => {
@@ -63,6 +83,8 @@ function readConfig(options: PluginOptions): Config {
     queueAlert: num(options.queue_alert, 5, 0, 100),
     waitAlertMinutes: num(options.wait_alert_minutes, 10, 0, 240),
     lang: parseLang(options.language),
+    savingsOn: options.savings !== false,
+    pricePerMinute: num(options.price_per_minute, DEFAULT_PRICE_PER_MINUTE, 0, 1),
   }
 }
 
@@ -79,6 +101,9 @@ type Radar = {
   rateLimitUntil: number
   /** Failed jobs per run id: a failed run is looked up once. */
   failureCache: Map<number, FailedJob[]>
+  savingsTimer: Timer | undefined
+  savingsSoon: Timer | undefined
+  savingsInFlight: boolean
 }
 
 const ownerOf = (radar: Radar): string => radar.ownerOverride || radar.config.owner
@@ -130,6 +155,9 @@ async function refresh($: EngineInterface, radar: Radar): Promise<void> {
     }
     await publish($, radar, next)
     radar.rateLimitUntil = hasRateLimit(next) ? next.updatedAt + 60_000 : 0
+    // First data for this owner: count savings now instead of in five minutes.
+    const sv = await read($, savingsAtom)
+    if (radar.config.savingsOn && (!sv || sv.owner !== who)) kickSavings($, radar)
   } catch (err) {
     // A refresh runs unawaited from a timer: surface the failure in the pane.
     await publishError(err instanceof Error ? err.message : String(err))
@@ -158,14 +186,127 @@ function kick($: EngineInterface, radar: Radar): void {
   refresh($, radar).catch(() => undefined)
 }
 
+/**
+ * One savings pass: list this month's completed runs of the watched repos, look
+ * up the billable minutes of runs not counted yet (a bounded number per pass),
+ * keep them in `$.store` by run id, and publish the month's totals.
+ */
+async function refreshSavings($: EngineInterface, radar: Radar): Promise<void> {
+  if (!radar.config.savingsOn || radar.savingsInFlight) return
+  const who = ownerOf(radar)
+  const s = await read($, snapshot)
+  if (!who || !s || s.owner !== who || s.repos.length === 0) return
+  if ((await $.clock.now()) < radar.rateLimitUntil) return
+  radar.savingsInFlight = true
+  try {
+    const now = await $.clock.now()
+    const month = monthKey(now)
+    const key = storeKey(who, month)
+    const usage = readMonth(await $.store.get(key))
+    let error: ApiError | undefined
+    const pending: Array<{ repo: string; id: number; day: string }> = []
+    for (const repo of s.repos.map(r => r.repo)) {
+      const listed = await completedRuns($, who, repo, `${month}-01`)
+      if (listed.error) error ??= listed.error
+      for (const run of listed.runs) {
+        if (!usage[String(run.id)]) pending.push({ repo, id: run.id, day: dayKey(Date.parse(run.created_at) || now) })
+      }
+    }
+    let counted = 0
+    for (const p of pending.slice(0, SAVINGS_RUNS_PER_PASS)) {
+      const m = await runMinutes($, who, p.repo, p.id)
+      if ('error' in m) {
+        error ??= m.error
+        if (m.error.kind === 'rateLimit') break
+        continue
+      }
+      usage[String(p.id)] = [p.repo, p.day, m.selfHosted, m.hosted]
+      counted++
+    }
+    if (counted > 0) {
+      await $.store.set(key, usage)
+      await forgetOldMonths($, who, month)
+    }
+    const result = summarize(usage, {
+      owner: who,
+      month,
+      today: dayKey(now),
+      pricePerMinute: radar.config.pricePerMinute,
+      runsPending: pending.length - counted,
+      updatedAt: now,
+      error,
+    })
+    await update($, savingsAtom, () => result)
+    if (error?.kind === 'rateLimit') radar.rateLimitUntil = now + 60_000
+    // Runs left to count: come back soon instead of waiting for the next pass.
+    else if (result.runsPending > 0 && counted > 0 && !radar.savingsSoon) {
+      radar.savingsSoon = $.clock.after(SAVINGS_CATCH_UP_MS, () => {
+        radar.savingsSoon = undefined
+        kickSavings($, radar)
+      })
+    }
+  } finally {
+    radar.savingsInFlight = false
+  }
+}
+
+/** Keeps the current and the previous month of an owner; older months are dropped. */
+async function forgetOldMonths($: EngineInterface, owner: string, month: string): Promise<void> {
+  const prefix = storeKey(owner, '')
+  const [y, m] = month.split('-').map(Number)
+  const previous = m === 1 ? `${(y ?? 0) - 1}-12` : `${y}-${String((m ?? 1) - 1).padStart(2, '0')}`
+  for (const key of await $.store.keys()) {
+    if (key.startsWith(prefix) && key !== storeKey(owner, month) && key !== storeKey(owner, previous)) {
+      await $.store.delete(key)
+    }
+  }
+}
+
+function kickSavings($: EngineInterface, radar: Radar): void {
+  refreshSavings($, radar).catch(() => undefined)
+}
+
 function start($: EngineInterface, radar: Radar): void {
   if (radar.timer) return
   radar.timer = $.clock.every(radar.config.intervalMs, () => kick($, radar))
+  if (radar.config.savingsOn) radar.savingsTimer = $.clock.every(SAVINGS_EVERY_MS, () => kickSavings($, radar))
 }
 
 function stop(radar: Radar): void {
   radar.timer?.cancel()
   radar.timer = undefined
+  radar.savingsTimer?.cancel()
+  radar.savingsTimer = undefined
+  radar.savingsSoon?.cancel()
+  radar.savingsSoon = undefined
+}
+
+/** `/radar savings`: the month's savings in the conversation, with the assumptions. */
+async function showSavings($: EngineInterface, radar: Radar): Promise<{ text: string }> {
+  const t = textOf(radar)
+  if (!radar.config.savingsOn) return { text: t.savings.off }
+  await refreshSavings($, radar)
+  const sv = await read($, savingsAtom)
+  if (!sv) return { text: t.cmd.needOwner }
+  const price = radar.config.pricePerMinute
+  const n = (x: number) => grouped(x, t.savings.thousands)
+  const nameW = Math.max(4, ...sv.perRepo.map(r => r.repo.length))
+  return {
+    text: t.savings.report({
+      month: sv.month,
+      total: money(sv.monthMinutes, price),
+      minutes: n(sv.monthMinutes),
+      today: money(sv.todayMinutes, price),
+      todayMinutes: n(sv.todayMinutes),
+      perRepo:
+        sv.perRepo.length > 0
+          ? sv.perRepo.map(r => `  ${r.repo.padEnd(nameW)}  ${money(r.minutes, price).padStart(8)}  ${n(r.minutes)} min`)
+          : [t.savings.none],
+      hosted: sv.hostedMinutes > 0 ? t.savings.hosted(n(sv.hostedMinutes)) : '',
+      price: `$${price}`,
+      counting: sv.runsPending > 0 ? t.savings.counting(sv.runsCounted, sv.runsCounted + sv.runsPending) : '',
+    }),
+  }
 }
 
 const FENCE = '```'
@@ -190,6 +331,7 @@ async function showLogs($: EngineInterface, radar: Radar, repo: string | undefin
 async function runCommand($: EngineInterface, radar: Radar, args: string): Promise<{ text: string }> {
   const words = args.split(/\s+/).filter(Boolean)
   if (words[0] && /^(logs|errors|errores)$/i.test(words[0])) return showLogs($, radar, words[1])
+  if (words[0] && /^(savings|ahorro)$/i.test(words[0])) return showSavings($, radar)
   if (words.some(w => /^(off|stop)$/i.test(w))) {
     stop(radar)
     await update($, polling, () => false)
@@ -227,6 +369,9 @@ export const register: Register = (on, options) => {
     memory: freshMemory(),
     rateLimitUntil: 0,
     failureCache: new Map(),
+    savingsTimer: undefined,
+    savingsSoon: undefined,
+    savingsInFlight: false,
   }
 
   on('session.start', async ($, e, next) => {
@@ -261,6 +406,49 @@ const RECENT = 5
 
 const pad = (text: string, n: number) => (text.length >= n ? text : text + ' '.repeat(n - text.length))
 
+type Elements = ReturnType<EngineInterface['ui']['resolve']>
+
+/** The savings section: month total first, then today, the top repos, and the basis. */
+function renderSavings(
+  Box: Elements['Box'],
+  Text: Elements['Text'],
+  sv: Savings,
+  t: Strings,
+  width: number,
+  mode: 'full' | 'compact' | 'summary',
+) {
+  const price = sv.pricePerMinute
+  const n = (x: number) => grouped(x, t.savings.thousands)
+  const top = sv.perRepo.slice(0, mode === 'full' ? 3 : 0)
+  const counting = sv.runsPending > 0 ? t.savings.counting(sv.runsCounted, sv.runsCounted + sv.runsPending) : ''
+  return (
+    <Box flexDirection="column">
+      <Box marginTop={1}>
+        <Text>
+          <Text bold>{t.savings.title}</Text>
+          <Text dimColor>{cut(`  ${t.savings.summary}`, Math.max(1, width - t.savings.title.length))}</Text>
+        </Text>
+      </Box>
+      {sv.monthMinutes === 0 && !counting && <Text dimColor>{cut(`  ${t.savings.none}`, width)}</Text>}
+      {(sv.monthMinutes > 0 || counting) && (
+        <Text color="green" bold>
+          {cut(`  ${t.savings.total(money(sv.monthMinutes, price), n(sv.monthMinutes))}`, width)}
+        </Text>
+      )}
+      {sv.monthMinutes > 0 && (
+        <Text dimColor>{cut(`     ${t.savings.today(money(sv.todayMinutes, price), n(sv.todayMinutes))}`, width)}</Text>
+      )}
+      {top.length > 0 && (
+        <Text dimColor>
+          {cut(`     ${top.map(r => `${r.repo} ${money(r.minutes, price)}`).join(' · ')}`, width)}
+        </Text>
+      )}
+      {counting && <Text color="yellow">{cut(`     ${counting}`, width)}</Text>}
+      <Text dimColor>{cut(`     ${t.savings.price(`$${price}`)}`, width)}</Text>
+    </Box>
+  )
+}
+
 async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0], radar: Radar) {
   const { Box, Text, Link } = $.ui.resolve(e)
   const t = textOf(radar)
@@ -284,6 +472,7 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
   const repoW = Math.min(28, Math.max(4, ...s.repos.map(r => r.repo.length)))
   const stale = (await $.clock.now()) - s.updatedAt > config.intervalMs * 2.5
   const partial = partialWarning(s, t)
+  const sv = config.savingsOn ? await read($, savingsAtom) : null
 
   const section = (title: string, summary: string) => (
     <Box marginTop={1}>
@@ -390,6 +579,7 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
           </Box>
         )
       })}
+      {sv && sv.owner === s.owner && renderSavings(Box, Text, sv, t, width, mode)}
       </>}
 
       <Box marginTop={1}>

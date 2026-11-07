@@ -167,6 +167,70 @@ export async function failedLog(
     .filter(l => l.trim() && !/^##\[(group|endgroup)\]/.test(l))
     .slice(-lines)
 }
+// ── Savings: billable minutes of completed runs ─────────────────
+//
+// API calls per savings pass (every SAVINGS_EVERY_MS, not every refresh):
+//   completedRuns 1 per watched repo per page (at most SAVINGS_MAX_PAGES)
+//   runMinutes    1 per run not counted before (at most SAVINGS_RUNS_PER_PASS)
+
+export const SAVINGS_MAX_PAGES = 3
+
+/** Completed runs of a repo created on or after `sinceDay` (YYYY-MM-DD), newest first. */
+export async function completedRuns(
+  $: EngineInterface,
+  owner: string,
+  repo: string,
+  sinceDay: string,
+): Promise<{ runs: Array<{ id: number; created_at: string }>; error?: ApiError }> {
+  const runs: Array<{ id: number; created_at: string }> = []
+  for (let page = 1; page <= SAVINGS_MAX_PAGES; page++) {
+    const r = parse<Array<{ id: number; created_at: string }>>(
+      await gh($, [
+        'api',
+        `repos/${owner}/${repo}/actions/runs?status=completed&created=%3E%3D${sinceDay}&per_page=100&page=${page}`,
+        '--jq',
+        '[.workflow_runs[] | {id, created_at}]',
+      ]),
+    )
+    if (typeof r === 'string') return { runs, error: apiError(r) }
+    runs.push(...r)
+    if (r.length < 100) break
+  }
+  return { runs }
+}
+
+/**
+ * Billable minutes of one run, split by where its jobs ran. GitHub rounds each
+ * job up to the whole minute, and every attempt (re-runs too) is billed.
+ */
+export async function runMinutes(
+  $: EngineInterface,
+  owner: string,
+  repo: string,
+  runId: number,
+): Promise<{ selfHosted: number; hosted: number } | { error: ApiError }> {
+  const r = parse<Array<{ sh: boolean; s: number }>>(
+    await gh($, [
+      'api',
+      `repos/${owner}/${repo}/actions/runs/${runId}/jobs?filter=all&per_page=100`,
+      '--jq',
+      '[.jobs[] | select(.started_at and .completed_at) | {sh: ((.labels | index("self-hosted")) != null), s: ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601))}]',
+    ]),
+  )
+  if (typeof r === 'string') return { error: apiError(r) }
+  let selfHosted = 0
+  let hosted = 0
+  for (const job of r) {
+    const minutes = billableMinutes(job.s)
+    if (job.sh) selfHosted += minutes
+    else hosted += minutes
+  }
+  return { selfHosted, hosted }
+}
+
+/** A job's billed minutes: rounded up to the minute, nothing for a job that never ran. */
+export const billableMinutes = (seconds: number): number => (seconds > 0 ? Math.ceil(seconds / 60) : 0)
+
 type RawJob = {
   id: number
   name: string
