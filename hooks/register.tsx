@@ -8,16 +8,21 @@ import {
   type AlertMemory,
   alerts,
   assignments,
+  apiError,
+  cut,
   duration,
   freshMemory,
   headline,
+  explain,
+  layout,
+  partialWarning,
   type Level,
   mark,
   parseRepos,
   queue,
+  reasonFor,
   statusLine,
   waitLevel,
-  waitReason,
 } from './logic'
 
 // Runner Radar: a live view of a self-hosted GitHub Actions runner fleet.
@@ -31,7 +36,7 @@ const COMMAND = 'radar'
 
 // Bump a shape tag when its value's fields change: it declines what an earlier
 // version stored, which outlives a reload.
-const snapshot = atom({ plugin: 'runner-radar', key: 'snapshot' } as const, null, { shape: 'snapshot-2' })
+const snapshot = atom({ plugin: 'runner-radar', key: 'snapshot' } as const, null, { shape: 'snapshot-3' })
 const polling = atom({ plugin: 'runner-radar', key: 'polling' } as const, false, { shape: 'polling-1' })
 
 type Config = {
@@ -70,6 +75,8 @@ type Radar = {
   langOverride: Lang | undefined
   kinds: Map<string, 'org' | 'user'>
   memory: AlertMemory
+  /** Avoid hammering GitHub after it reports primary or secondary rate limiting. */
+  rateLimitUntil: number
   /** Failed jobs per run id: a failed run is looked up once. */
   failureCache: Map<number, FailedJob[]>
 }
@@ -88,36 +95,52 @@ async function refresh($: EngineInterface, radar: Radar): Promise<void> {
     runners: [],
     jobs: [],
     repos: [],
-    error,
+    error: apiError(error),
+    runnerErrors: [],
   })
+  const publishError = async (error: string): Promise<Snapshot> => {
+    const next = await empty(error)
+    await publish($, radar, next)
+    radar.rateLimitUntil = hasRateLimit(next) ? next.updatedAt + 60_000 : 0
+    return next
+  }
   try {
+    if ((await $.clock.now()) < radar.rateLimitUntil) return
     let kind = radar.kinds.get(who)
     if (!kind) {
       const k = await ownerKind($, who)
-      if (k !== 'org' && k !== 'user') return await publish($, radar, await empty(k))
+      if (k !== 'org' && k !== 'user') return void (await publishError(k))
       kind = k
       radar.kinds.set(who, k)
     }
     const repos = await listRepos($, who, kind, radar.config.repos, radar.config.maxRepos)
-    if (typeof repos === 'string') return await publish($, radar, await empty(repos))
+    if (typeof repos === 'string') return void (await publishError(repos))
     const [fleet, scans] = await Promise.all([
       listRunners($, who, kind, repos),
       Promise.all(repos.map(repo => scanRepo($, who, repo, radar.failureCache))),
     ])
-    await publish($, radar, {
+    const next: Snapshot = {
       owner: who,
       updatedAt: await $.clock.now(),
       runners: fleet.runners,
       jobs: scans.flatMap(s => s.jobs),
       repos: scans.map(s => s.summary),
       error: fleet.error,
-    })
+      runnerErrors: fleet.repoErrors,
+    }
+    await publish($, radar, next)
+    radar.rateLimitUntil = hasRateLimit(next) ? next.updatedAt + 60_000 : 0
   } catch (err) {
     // A refresh runs unawaited from a timer: surface the failure in the pane.
-    await publish($, radar, await empty(err instanceof Error ? err.message : String(err)))
+    await publishError(err instanceof Error ? err.message : String(err))
   } finally {
     radar.inFlight = false
   }
+}
+
+function hasRateLimit(s: Snapshot): boolean {
+  return s.error?.kind === 'rateLimit' || s.runnerErrors.some(e => e.error.kind === 'rateLimit') ||
+    s.repos.some(r => r.error?.kind === 'rateLimit')
 }
 
 async function publish($: EngineInterface, radar: Radar, next: Snapshot): Promise<void> {
@@ -154,6 +177,7 @@ async function showLogs($: EngineInterface, radar: Radar, repo: string | undefin
   const s = await read($, snapshot)
   const summary = s?.repos.find(r => r.repo.toLowerCase() === repo.toLowerCase())
   if (!s || !summary) return { text: t.cmd.logsNoRepo(repo) }
+  if (summary.error) return { text: t.cmd.logsUnavailable(summary.repo, explain(summary.error, t)) }
   const failure = summary.failure
   if (!failure) return { text: t.cmd.logsNoFailure(summary.repo) }
   const header = t.cmd.logsHeader(summary.repo, failure.workflow, failure.branch, failure.url)
@@ -201,6 +225,7 @@ export const register: Register = (on, options) => {
     langOverride: undefined,
     kinds: new Map(),
     memory: freshMemory(),
+    rateLimitUntil: 0,
     failureCache: new Map(),
   }
 
@@ -243,8 +268,9 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
   if (!s) return <Text dimColor>{t.asking}</Text>
 
   const config = radar.config
-  const width = Math.max(40, ((e as { viewport?: { columns?: number } }).viewport?.columns ?? 72) - 4)
-  const cut = (text: string, max: number) => (max <= 1 ? '' : text.length > max ? text.slice(0, max - 1) + '…' : text)
+  const columns = (e as { viewport?: { columns?: number } }).viewport?.columns ?? 76
+  const width = Math.max(1, columns - 4)
+  const mode = layout(width)
   const now = s.updatedAt
   const head = headline(s, now, config, t)
   const busyWith = assignments(s)
@@ -257,6 +283,7 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
   const quiet = s.repos.filter(r => !r.running && !r.queued && !r.error)
   const repoW = Math.min(28, Math.max(4, ...s.repos.map(r => r.repo.length)))
   const stale = (await $.clock.now()) - s.updatedAt > config.intervalMs * 2.5
+  const partial = partialWarning(s, t)
 
   const section = (title: string, summary: string) => (
     <Box marginTop={1}>
@@ -274,9 +301,14 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
         {cut(`${LEVEL_ICON[head.level]} ${head.text}`, width)}
       </Text>
 
+      {mode === 'summary' && <Text dimColor>{cut(t.narrow(columns), width)}</Text>}
+      {partial && <Text color="yellow">{cut(partial, width)}</Text>}
+
+      {mode !== 'summary' && <>
+
       {section(t.runnersTitle, t.runnersSummary(online, s.runners.length, working))}
-      {s.runners.length === 0 && <Text dimColor>{cut(`  ${s.error ?? t.noRunners(s.owner)}`, width)}</Text>}
-      {s.runners.length > 0 && s.error && <Text color="yellow">{cut(`  ${s.error}`, width)}</Text>}
+      {s.runners.length === 0 && <Text dimColor>{cut(`  ${s.error ? explain(s.error, t) : t.noRunners(s.owner)}`, width)}</Text>}
+      {s.runners.length > 0 && s.error && <Text color="yellow">{cut(`  ${explain(s.error, t)}`, width)}</Text>}
       {s.runners.map(r => {
         const job = busyWith.get(r.name)
         const level: Level = !r.online ? 'bad' : r.busy ? 'warn' : 'ok'
@@ -297,8 +329,17 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
       {section(t.queueTitle, t.queueSummary(waiting.length))}
       {waiting.slice(0, 8).map(j => {
         const wait = now - j.createdAt
-        const why = s.error ? undefined : waitReason(j, s.runners, t)
-        const what = cut(`${j.repo} › ${j.name}`, Math.max(12, Math.floor(width * 0.4)))
+        const why = reasonFor(j, s, t)
+        const what = cut(`${j.repo} › ${j.name}`, mode === 'compact' ? Math.max(8, width - 16) : Math.max(12, Math.floor(width * 0.4)))
+        if (mode === 'compact') return (
+          <Box flexDirection="column">
+            <Text>
+              <Text color={LEVEL_COLOR[waitLevel(wait, config.waitAlertMinutes)]} bold>{`  ${duration(wait).padStart(6)}`}</Text>
+              <Text>{`  ${what}`}</Text>
+            </Text>
+            {why && <Text color={why.blocking ? 'red' : 'gray'}>{cut(`    · ${why.text}`, width)}</Text>}
+          </Box>
+        )
         return (
           <Text>
             <Text color={LEVEL_COLOR[waitLevel(wait, config.waitAlertMinutes)]} bold>
@@ -332,7 +373,7 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
               })}
               <Text>{' '.repeat(RECENT - r.recent.length)}</Text>
               <Text dimColor={!r.running && !r.queued}>{cut(`  ${activity}`, width - repoW - RECENT - 6)}</Text>
-              {r.error && <Text color="red">{cut(`  ${r.error}`, width - repoW - RECENT - activity.length - 8)}</Text>}
+              {r.error && <Text color="red">{cut(`  ${explain(r.error, t)}`, width - repoW - RECENT - activity.length - 8)}</Text>}
             </Text>
             {/* What failed and where, with a way to read the error. */}
             {f && (
@@ -349,6 +390,7 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
           </Box>
         )
       })}
+      </>}
 
       <Box marginTop={1}>
         <Text dimColor>

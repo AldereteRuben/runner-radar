@@ -34,6 +34,26 @@ export type Failure = {
   jobs: FailedJob[]
 }
 
+/**
+ * What kind of failure a GitHub query hit. The pane turns the kind into a short,
+ * localized, actionable sentence; `detail` keeps gh's own words for `other`.
+ */
+export type ErrorKind =
+  | 'orgScope'
+  | 'rateLimit'
+  | 'auth'
+  | 'forbidden'
+  | 'notFound'
+  | 'network'
+  | 'ghMissing'
+  | 'unexpected'
+  | 'other'
+
+export type ApiError = { kind: ErrorKind; detail: string }
+
+/** A repo whose runner list could not be read this refresh. */
+export type RunnerError = { repo: string; error: ApiError }
+
 export type RepoSummary = {
   repo: string
   running: number
@@ -41,7 +61,7 @@ export type RepoSummary = {
   /** Conclusions of the latest completed runs, newest first. */
   recent: string[]
   failure?: Failure
-  error?: string
+  error?: ApiError
 }
 
 export type Snapshot = {
@@ -50,7 +70,10 @@ export type Snapshot = {
   runners: Runner[]
   jobs: Job[]
   repos: RepoSummary[]
-  error?: string
+  /** The org runner list (or the whole refresh) failed. */
+  error?: ApiError
+  /** Repo-level runner lists that failed: the runner inventory is partial. */
+  runnerErrors: RunnerError[]
 }
 
 declare module 'claude-code' {

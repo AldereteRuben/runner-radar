@@ -1,7 +1,7 @@
 {
   "name": "runner-radar",
   "displayName": "Runner Radar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Live radar for your self-hosted GitHub Actions runners inside Claude Code: who is busy with what, what is waiting in the queue and for how long, across all your repos.",
   "author": { "name": "Ruben Alderete", "url": "https://github.com/AldereteRuben" },
   "homepage": "https://github.com/AldereteRuben/runner-radar",
@@ -40,7 +40,7 @@
     "interval_seconds": {
       "type": "number",
       "title": "Refresh interval (seconds)",
-      "description": "How often to poll GitHub. Each refresh costs about one API call per repo plus one per active run.",
+      "description": "How often to poll GitHub. Busy repos can use up to 9 calls per watched repo; use a longer interval or watch fewer repos to stay within the API limit.",
       "default": 30,
       "min": 15,
       "max": 600

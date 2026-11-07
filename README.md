@@ -41,7 +41,7 @@ Plain words only: a runner is **free**, **working** or **offline**. The pane als
 - **Status line**: `radar · 1/2 online · 1 working · 2 waiting · longest 12m04s`.
 - **Toasts** when a runner goes offline (or comes back), when the queue reaches a threshold, or when a job has waited too long.
 
-It works for organizations (org-level runners) and personal accounts (repo-level runners).
+It works for organizations (org-level runners) and personal accounts (repo-level runners). When a repo runner query fails, the pane marks the inventory as incomplete and keeps the runners it could read. It does not claim a missing label is definitive while inventory is incomplete.
 
 ## Requirements
 
@@ -82,7 +82,7 @@ In the desktop app, where `/plugin` does not run: click **+** next to the prompt
 | `/radar refresh` | Re-opens the pane and refreshes now |
 | `/radar off` | Stops polling and closes the pane |
 
-The pane needs a terminal about 110 columns wide; when it does not fit, the status line still has the summary.
+The pane keeps its headline visible at narrow widths. At 44 columns it switches to a compact view, and at 76 columns it shows the full detail view.
 
 ## Configure
 
@@ -98,7 +98,18 @@ The pane needs a terminal about 110 columns wide; when it does not fit, the stat
 | Queue alert | 5 jobs | 0 turns it off |
 | Wait alert | 10 min | 0 turns it off |
 
-**API budget**: each refresh costs about one call per watched repo, plus one per active run (at most 6 per repo), plus the runner lists. With 6 repos every 30 s that is roughly 1,000 to 2,000 calls an hour, well inside GitHub's 5,000/hour for a signed-in user. Raise the interval if you watch many busy repos.
+**GitHub API usage**: self-hosted describes where jobs run; Runner Radar still calls GitHub's API through `gh`. At each refresh it lists runners once per watched repo, plus once at org level for an organization; scans each repo's runs once; then fetches jobs for up to 6 active runs per repo. Auto repo mode adds one repo-list call per refresh. With 6 repos in auto mode, that is up to 50 calls per refresh for an organization (49 for a personal account), before failed-run detail lookups. If all six repos have a newly failed run, those add up to 6 more calls: up to 56 (org) or 55 (personal), or 6,720 / 6,600 per hour at the 30-second default. The first refresh can add one call to identify the owner type. Most refreshes use fewer calls because they have fewer than six active runs per repo; successful failed-run lookups are cached.
+
+GitHub's standard authenticated REST API limit is 5,000 requests per hour for personal access tokens and user-authorized apps, shared with other tools using the same account ([GitHub rate limit documentation](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)). Busy fleets at a 30-second interval can exceed it. For busy repos, start at 60 seconds or longer and/or watch fewer repos. The limit and actual usage depend on your account and other API activity; the mod does not make a separate quota-check request. The estimate excludes the additional one-off call made by `/radar logs`. If GitHub reports a rate limit, the pane explains it and pauses requests for one minute before retrying.
+
+At terminal widths below 44 columns, Runner Radar shows the headline and a short note to widen the pane. From 44 to 75 columns it uses a compact layout; at 76 columns and above it shows full details.
+
+## What's new in 0.2.0
+
+- Shows when repo runner inventory is incomplete, while retaining data from successful queries.
+- Counts only recognized pending self-hosted jobs in the queue.
+- Gives clearer, localized GitHub permission, authentication, network, and rate-limit errors.
+- Adapts the pane to narrow terminal widths and documents the API call budget.
 
 ## How it works
 

@@ -1,8 +1,75 @@
-import type { Job, Runner, Snapshot } from '../types'
+import type { ApiError, ErrorKind, Job, Runner, Snapshot } from '../types'
 import type { Strings } from './i18n'
 
 // Pure functions over a snapshot: no `$`, no GitHub, easy to test. Every phrase
 // comes from `Strings`, so the logic stays the same in every language.
+
+// ── Job status ──────────────────────────────────────────────────
+
+/**
+ * The job statuses that mean "waiting for a runner": the only ones counted as
+ * queue. Everything else (`in_progress`, `completed`, a conclusion such as
+ * `success` / `failure` / `cancelled` / `skipped`, or a status GitHub adds later)
+ * is not queue.
+ */
+export const PENDING_STATUSES: readonly string[] = ['queued', 'waiting', 'pending', 'requested']
+const PENDING = new Set(PENDING_STATUSES)
+
+export const isPending = (status: string): boolean => PENDING.has(status)
+
+/** Statuses of runs and jobs the radar keeps: pending ones plus running ones. */
+export const isActive = (status: string): boolean => isPending(status) || status === 'in_progress'
+
+// ── Errors ──────────────────────────────────────────────────────
+
+/** Sorts gh's error text into a kind the pane can explain in plain words. */
+export function classify(raw: string): ErrorKind {
+  const s = raw.toLowerCase()
+  if (/rate limit|secondary rate|abuse detection/.test(s)) return 'rateLimit'
+  if (/gh cli not found|enoent|executable file not found/.test(s)) return 'ghMissing'
+  if (/http 401|bad credentials|gh auth login|not logged in|authentication required/.test(s)) return 'auth'
+  if (/http 403|forbidden|must have admin|resource not accessible/.test(s)) return 'forbidden'
+  if (/http 404|not found/.test(s)) return 'notFound'
+  if (/timed? ?out|timeout|etimedout|econnreset|enotfound|econnrefused|error connecting|could not resolve|network|http 50[234]/.test(s))
+    return 'network'
+  if (/unexpected response/.test(s)) return 'unexpected'
+  return 'other'
+}
+
+export const apiError = (raw: string): ApiError => ({ kind: classify(raw), detail: raw })
+
+/** An org runner list failure: a permission problem means the admin:org scope. */
+export function orgRunnerError(raw: string): ApiError {
+  const e = apiError(raw)
+  if (e.kind === 'forbidden' || e.kind === 'notFound' || /admin:org/i.test(raw)) return { kind: 'orgScope', detail: raw }
+  return e
+}
+
+export const explain = (e: ApiError, t: Strings): string => t.error[e.kind](e.detail)
+
+// ── Runner inventory ────────────────────────────────────────────
+
+/**
+ * How much of the fleet the snapshot saw: `complete`; `partial` when some repo
+ * runner lists failed (what we have is real, but a runner may be missing); or
+ * `unknown` when the org list (or the whole refresh) failed.
+ */
+export function inventory(s: Snapshot): 'complete' | 'partial' | 'unknown' {
+  if (s.error) return 'unknown'
+  if (s.runnerErrors.length > 0) return 'partial'
+  return 'complete'
+}
+
+/** The pane's warning when some repo runner lists could not be read. */
+export function partialWarning(s: Snapshot, t: Strings): string | undefined {
+  if (s.runnerErrors.length === 0) return undefined
+  const repos = s.runnerErrors.map(e => e.repo)
+  const shown = repos.length > 3 ? [...repos.slice(0, 3), `+${repos.length - 3}`] : repos
+  const kinds = new Set(s.runnerErrors.map(e => e.error.kind))
+  const first = s.runnerErrors[0]
+  const why = kinds.size === 1 && first ? explain(first.error, t) : ''
+  return t.runnersPartial(shown, why)
+}
 
 /** `4m10s`, `1h02m`, `35s`. */
 export function duration(ms: number): string {
@@ -13,11 +80,9 @@ export function duration(ms: number): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
 }
 
-/** Self-hosted jobs not running yet, longest waiting first. */
+/** Self-hosted jobs in a pending status (see `PENDING_STATUSES`), longest waiting first. */
 export function queue(s: Snapshot): Job[] {
-  return s.jobs
-    .filter(j => j.selfHosted && j.status !== 'in_progress')
-    .sort((a, b) => a.createdAt - b.createdAt)
+  return s.jobs.filter(j => j.selfHosted && isPending(j.status)).sort((a, b) => a.createdAt - b.createdAt)
 }
 
 /** The job each busy runner is working on, by runner name. */
@@ -28,16 +93,19 @@ export function assignments(s: Snapshot): Map<string, Job> {
 }
 
 export function statusLine(s: Snapshot, now: number, t: Strings): string {
-  if (s.error && s.runners.length === 0) return `radar · ${s.error}`
   const waiting = queue(s)
   const oldest = waiting[0]
-  return t.status(
+  const line = t.status(
     s.runners.filter(r => r.online).length,
     s.runners.length,
     s.runners.filter(r => r.busy).length,
     waiting.length,
     oldest ? duration(now - oldest.createdAt) : '',
   )
+  if (s.error) return `${line} · ${explain(s.error, t)}`
+  if (inventory(s) === 'partial') return `${line} · ${t.statusPartial}`
+  const repoErrors = s.repos.filter(r => r.error).length
+  return repoErrors ? `${line} · ${t.headline.repoErrors(repoErrors)}` : line
 }
 
 const lower = (xs: string[]) => xs.map(x => x.toLowerCase())
@@ -46,8 +114,16 @@ const lower = (xs: string[]) => xs.map(x => x.toLowerCase())
  * Why a queued self-hosted job is still waiting, from the runners we can see:
  * a label no runner has (it will never start), matching runners offline, or all
  * of them working. `undefined` when a free runner fits (it is about to start).
+ *
+ * With `partial` (some runner lists failed) a missing label or offline runners
+ * are only what we can see: the reason says so and never blocks.
  */
-export function waitReason(job: Job, runners: Runner[], t: Strings): { text: string; blocking: boolean } | undefined {
+export function waitReason(
+  job: Job,
+  runners: Runner[],
+  t: Strings,
+  partial = false,
+): { text: string; blocking: boolean } | undefined {
   const wanted = lower(job.labels)
   const fits = runners.filter(r => {
     const has = new Set(lower(r.labels))
@@ -55,13 +131,28 @@ export function waitReason(job: Job, runners: Runner[], t: Strings): { text: str
   })
   if (fits.length === 0) {
     const missing = job.labels.filter(l => !runners.some(r => lower(r.labels).includes(l.toLowerCase())))
-    const shown = missing.length ? missing : job.labels.filter(l => l.toLowerCase() !== 'self-hosted')
-    return { text: t.reason.noLabel(shown.length ? shown : job.labels), blocking: true }
+    const named = missing.length ? missing : job.labels.filter(l => l.toLowerCase() !== 'self-hosted')
+    const shown = named.length ? named : job.labels
+    if (partial) return { text: t.reason.noVisibleLabel(shown), blocking: false }
+    return { text: t.reason.noLabel(shown), blocking: true }
   }
   const online = fits.filter(r => r.online)
-  if (online.length === 0) return { text: t.reason.offline, blocking: true }
+  if (online.length === 0) {
+    if (partial) return { text: t.reason.offlineVisible, blocking: false }
+    return { text: t.reason.offline, blocking: true }
+  }
   if (online.every(r => r.busy)) return { text: t.reason.working(online.length), blocking: false }
   return undefined
+}
+
+/**
+ * The wait reason the snapshot supports: none when the runner inventory is
+ * unknown, a hedged one when it is partial. Pane and headline both use this.
+ */
+export function reasonFor(job: Job, s: Snapshot, t: Strings): { text: string; blocking: boolean } | undefined {
+  const inv = inventory(s)
+  if (inv === 'unknown') return undefined
+  return waitReason(job, s.runners, t, inv === 'partial')
 }
 
 export type Level = 'ok' | 'warn' | 'bad'
@@ -80,16 +171,24 @@ export function waitLevel(waitMs: number, waitAlertMinutes: number): Level {
 export function headline(s: Snapshot, now: number, config: AlertConfig, t: Strings): { level: Level; text: string } {
   const offline = s.runners.filter(r => !r.online)
   const waiting = queue(s)
-  const stuck = s.error ? [] : waiting.filter(j => waitReason(j, s.runners, t)?.blocking)
+  const stuck = waiting.filter(j => reasonFor(j, s, t)?.blocking)
   const oldest = waiting[0]
   const wait = oldest ? t.headline.waiting(waiting.length, duration(now - oldest.createdAt)) : ''
+  const partial = s.runnerErrors.length ? t.headline.partial(s.runnerErrors.length) : ''
+  const repoErrors = s.repos.filter(r => r.error).length
+  const scanWarning = repoErrors ? t.headline.repoErrors(repoErrors) : ''
 
   const bad: string[] = []
-  if (s.error && s.runners.length === 0) bad.push(s.error)
+  if (s.error && s.runners.length === 0) bad.push(explain(s.error, t))
   if (offline.length === 1 && offline[0]) bad.push(t.headline.runnerOffline(offline[0].name))
   if (offline.length > 1) bad.push(t.headline.runnersOffline(offline.length))
   if (stuck.length) bad.push(t.headline.cantStart(stuck.length))
-  if (bad.length) return { level: 'bad', text: [...bad, wait].filter(Boolean).join(' · ') }
+  if (bad.length) return { level: 'bad', text: [...bad, wait, partial, scanWarning].filter(Boolean).join(' · ') }
+
+  if (s.error) return { level: 'warn', text: [explain(s.error, t), wait].filter(Boolean).join(' · ') }
+
+  // Partial inventory: never "all good", always say the list is incomplete.
+  if (partial || scanWarning) return { level: 'warn', text: [wait, partial, scanWarning].filter(Boolean).join(' · ') }
 
   const longWait = oldest && waitLevel(now - oldest.createdAt, config.waitAlertMinutes) !== 'ok'
   const bigQueue = config.queueAlert > 0 && waiting.length >= config.queueAlert
@@ -163,6 +262,28 @@ export function mark(conclusion: string): { glyph: string; color: string } {
   if (conclusion === 'cancelled') return { glyph: '⊘', color: 'gray' }
   return { glyph: '·', color: 'gray' }
 }
+
+// ── Layout ──────────────────────────────────────────────────────
+
+/** Below this many body columns the pane shows only the summary. */
+export const MIN_COLUMNS = 40
+/** From this many body columns every row keeps its detail on one line. */
+export const FULL_COLUMNS = 72
+
+/**
+ * How the pane lays out at a body width: `full` rows; `compact` rows with
+ * shorter columns and each wait reason on its own line; `summary`, only the
+ * headline, status and warnings.
+ */
+export function layout(columns: number): 'full' | 'compact' | 'summary' {
+  if (columns < MIN_COLUMNS) return 'summary'
+  if (columns < FULL_COLUMNS) return 'compact'
+  return 'full'
+}
+
+/** `text` cut to `max` cells with an ellipsis; empty when there is no room. */
+export const cut = (text: string, max: number): string =>
+  max <= 1 ? '' : text.length > max ? text.slice(0, max - 1) + '…' : text
 
 export function parseRepos(value: unknown): string[] {
   const list = Array.isArray(value) ? value : String(value ?? '').split(',')

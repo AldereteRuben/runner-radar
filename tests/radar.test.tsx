@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { strings } from '../hooks/i18n'
-import { alerts, duration, freshMemory, headline, parseRepos, queue, statusLine, waitLevel, waitReason } from '../hooks/logic'
+import { alerts, apiError, duration, freshMemory, headline, layout, parseRepos, partialWarning, queue, reasonFor, statusLine, waitLevel, waitReason } from '../hooks/logic'
 import type { Snapshot } from '../types'
 
 const NOW = Date.UTC(2026, 10, 7, 15, 0, 0)
@@ -25,7 +25,7 @@ const PANE = {
 } as const
 
 /** A fake `gh`: answers by the API path in argv. */
-function fakeGh(argv: readonly string[]): { exitCode: number; stdout: string; stderr: string } {
+function fakeGh(argv: readonly string[], failApiRunner = false): { exitCode: number; stdout: string; stderr: string } {
   if (argv[1] === 'run' && argv[2] === 'view') {
     const log = [
       'e2e\tRun tests\t2026-11-07T14:50:00.0000000Z FAIL tests/login.spec.ts',
@@ -34,6 +34,9 @@ function fakeGh(argv: readonly string[]): { exitCode: number; stdout: string; st
     return { exitCode: 0, stdout: log.join('\n') + '\n', stderr: '' }
   }
   const path = argv[2] ?? ''
+  if (failApiRunner && path === 'repos/acme/api/actions/runners') {
+    return { exitCode: 1, stdout: '', stderr: 'HTTP 403: Forbidden' }
+  }
   const ok = (v: unknown) => ({ exitCode: 0, stdout: JSON.stringify(v), stderr: '' })
   if (path === 'users/acme') return ok({ type: 'Organization' })
   if (path.startsWith('orgs/acme/repos')) {
@@ -75,7 +78,7 @@ function fakeGh(argv: readonly string[]): { exitCode: number; stdout: string; st
 
 type On = Parameters<Parameters<typeof test>[2]>[1]
 
-function engine(on: On, toasts: string[] = []) {
+function engine(on: On, toasts: string[] = [], runGh: (argv: readonly string[]) => ReturnType<typeof fakeGh> = argv => fakeGh(argv)) {
   on('command.register', () => ({ value: { command: 'radar' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.close', () => ({ value: undefined }))
@@ -87,7 +90,7 @@ function engine(on: On, toasts: string[] = []) {
     toasts.push(String((e as { text: string }).text))
     return { value: undefined }
   })
-  on('process.run', (_, e) => ({ value: fakeGh((e as { argv: readonly string[] }).argv) }))
+  on('process.run', (_, e) => ({ value: runGh((e as { argv: readonly string[] }).argv) }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
 }
 
@@ -127,6 +130,85 @@ test('/radar shows working runners, the queue with its reason, and repos', { opt
   await ui.unmount()
 
   expect(toasts.some(x => x.includes('api › lint has waited 12m00s'))).toBe(true)
+})
+
+test('partial runner API failures are shown and clear after a successful refresh', { options: { owner: 'acme' } }, async ($, on) => {
+  let fail = true
+  engine(on, [], argv => fakeGh(argv, fail))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await new Promise(resolve => setTimeout(resolve, 80))
+
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Runner list incomplete.*api/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /1 of 2 online/ })).toBeDefined()
+  await ui.unmount()
+
+  fail = false
+  await $.command.run({ command: 'radar', args: 'refresh' })
+  await new Promise(resolve => setTimeout(resolve, 80))
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Runner list incomplete/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('rate-limit responses pause the next refresh instead of immediately retrying', { options: { owner: 'acme' } }, async ($, on) => {
+  let calls = 0
+  engine(on, [], argv => {
+    calls++
+    if (argv[2] === 'users/acme') return { exitCode: 1, stdout: '', stderr: 'API rate limit exceeded' }
+    return fakeGh(argv)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await new Promise(resolve => setTimeout(resolve, 60))
+  const afterFailure = calls
+  expect(afterFailure).toBe(1)
+  await $.command.run({ command: 'radar', args: 'refresh' })
+  await new Promise(resolve => setTimeout(resolve, 40))
+  expect(calls).toBe(afterFailure)
+})
+
+test('rate limits from active-job lookups reach the pane and pause polling', { options: { owner: 'acme' } }, async ($, on) => {
+  let calls = 0
+  engine(on, [], argv => {
+    calls++
+    if (argv[2] === 'repos/acme/api/actions/runs/10/jobs?per_page=50') {
+      return { exitCode: 1, stdout: '', stderr: 'API rate limit exceeded' }
+    }
+    return fakeGh(argv)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await new Promise(resolve => setTimeout(resolve, 80))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /GitHub API rate limit reached/ })).toBeDefined()
+  await ui.unmount()
+  const afterFailure = calls
+  await $.command.run({ command: 'radar', args: 'refresh' })
+  await new Promise(resolve => setTimeout(resolve, 40))
+  expect(calls).toBe(afterFailure)
+})
+
+test('rate limits from failed-run detail lookups reach the pane and pause polling', { options: { owner: 'acme' } }, async ($, on) => {
+  let calls = 0
+  engine(on, [], argv => {
+    calls++
+    if (argv[2] === 'repos/acme/web/actions/runs/20/jobs?filter=latest&per_page=50') {
+      return { exitCode: 1, stdout: '', stderr: 'API rate limit exceeded' }
+    }
+    return fakeGh(argv)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await new Promise(resolve => setTimeout(resolve, 80))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /GitHub API rate limit reached/ })).toBeDefined()
+  await ui.unmount()
+  const afterFailure = calls
+  await $.command.run({ command: 'radar', args: 'refresh' })
+  await new Promise(resolve => setTimeout(resolve, 40))
+  expect(calls).toBe(afterFailure)
 })
 
 test('/radar logs <repo> prints the failed steps of the latest run', { options: { owner: 'acme' } }, async ($, on) => {
@@ -193,6 +275,7 @@ const base = (over: Partial<Snapshot> = {}): Snapshot => ({
   runners: [{ id: 1, name: 'box-1', online: true, busy: false, labels: ['self-hosted', 'linux'] }],
   jobs: [],
   repos: [],
+  runnerErrors: [],
   ...over,
 })
 
@@ -222,6 +305,13 @@ test('queue sorts by longest wait and the status line reports it', () => {
   expect(statusLine(s, NOW, es)).toBe('radar · 1/1 conectados · 2 esperando · máx 9m00s')
 })
 
+test('queue includes only recognized pending self-hosted job statuses', () => {
+  const statuses = ['queued', 'waiting', 'pending', 'requested', 'in_progress', 'completed', 'cancelled', 'success', 'failure', 'skipped', 'future_status']
+  const jobs = statuses.map((status, i) => ({ ...job(i, i), status }))
+  expect(queue(base({ jobs })).map(j => j.status)).toEqual(['requested', 'pending', 'waiting', 'queued'])
+  expect(queue(base({ jobs: jobs.map(j => ({ ...j, selfHosted: false })) }))).toEqual([])
+})
+
 test('alerts fire once per episode: offline runner, queue size, long wait', () => {
   const memory = freshMemory()
   const config = { queueAlert: 2, waitAlertMinutes: 5 }
@@ -247,6 +337,32 @@ test('waitReason: a missing label, offline runners, a working fleet', () => {
   expect(waitReason(job(4, 3), two, en)?.text).toBe('all 2 of its runners are working')
   // Labels match case-insensitively; a free fit means it is about to start.
   expect(waitReason(job(5, 3), [linux], en)).toBeUndefined()
+})
+
+test('partial runner inventory never claims a missing label or offline fleet is definitive', () => {
+  const gpuJob = { ...job(1, 3), labels: ['self-hosted', 'gpu'] }
+  const partial = base({ runnerErrors: [{ repo: 'private', error: apiError('HTTP 403: Forbidden') }] })
+  expect(reasonFor(gpuJob, partial, en)).toEqual({ text: 'no visible runner has the label "gpu" (runner list incomplete)', blocking: false })
+  expect(reasonFor(gpuJob, partial, es)?.text).toContain('ningún runner visible')
+  expect(reasonFor(job(2, 3), { ...partial, runners: [{ id: 1, name: 'box', online: false, busy: false, labels: ['self-hosted', 'linux'] }] }, en)?.text)
+    .toContain('visible runners are offline')
+  expect(reasonFor(gpuJob, base({ error: apiError('network error') }), en)).toBeUndefined()
+  expect(partialWarning(partial, en)).toContain('private')
+  expect(headline(partial, NOW, { queueAlert: 5, waitAlertMinutes: 10 }, en).level).toBe('warn')
+})
+
+test('pane layout keeps summary below 40 body columns and compacts narrow views', () => {
+  expect(layout(39)).toBe('summary')
+  expect(layout(40)).toBe('compact')
+  expect(layout(71)).toBe('compact')
+  expect(layout(72)).toBe('full')
+})
+
+test('GitHub errors are classified into actionable categories', () => {
+  expect(apiError('API rate limit exceeded').kind).toBe('rateLimit')
+  expect(apiError('gh auth login required').kind).toBe('auth')
+  expect(apiError('HTTP 403: Forbidden').kind).toBe('forbidden')
+  expect(apiError('connect ETIMEDOUT').kind).toBe('network')
 })
 
 test('headline: all good, a warning on a long wait, bad when a job cannot start', () => {

@@ -1,15 +1,23 @@
 import type { EngineInterface } from 'claude-code'
 
-import type { FailedJob, Failure, Job, RepoSummary, Runner } from '../types'
+import type { ApiError, FailedJob, Failure, Job, RepoSummary, Runner, RunnerError } from '../types'
+import { apiError, isActive, isPending, orgRunnerError } from './logic'
 
 // Everything that talks to GitHub goes through the `gh` CLI, with the user's own
 // session: the mod never stores or reads a token itself.
+//
+// API calls per refresh (the README's budget is computed from these):
+//   ownerKind   1, after the first successful lookup for an owner (cached)
+//   listRepos   1 in auto mode, 0 with a configured repo list
+//   listRunners 1 for an org, plus 1 per watched repo
+//   scanRepo    1 per watched repo, plus 1 per active run (at most
+//               MAX_ACTIVE_RUNS_PER_REPO), plus 1 when the latest run failed and
+//               that run was not looked up before
 
 export type Gh = { ok: true; out: string } | { ok: false; error: string }
 
 /** Active runs per repo whose jobs we fetch; caps the API cost of a busy repo. */
-const MAX_ACTIVE_RUNS_PER_REPO = 6
-const ACTIVE = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested'])
+export const MAX_ACTIVE_RUNS_PER_REPO = 6
 
 export async function gh($: EngineInterface, args: string[]): Promise<Gh> {
   try {
@@ -86,22 +94,26 @@ export async function listRunners(
   owner: string,
   kind: 'org' | 'user',
   repos: string[],
-): Promise<{ runners: Runner[]; error?: string }> {
+): Promise<{ runners: Runner[]; error?: ApiError; repoErrors: RunnerError[] }> {
   const byId = new Map<number, Runner>()
-  let error: string | undefined
+  let error: ApiError | undefined
   if (kind === 'org') {
     const r = parse<RawRunner[]>(await gh($, ['api', `orgs/${owner}/actions/runners`, '--jq', RUNNERS_JQ]))
-    if (typeof r === 'string') error = /admin:org|403|404/.test(r) ? 'org runners need the admin:org scope (gh auth refresh -s admin:org)' : r
+    if (typeof r === 'string') error = orgRunnerError(r)
     else r.forEach(x => byId.set(x.id, toRunner(x)))
   }
   const perRepo = await Promise.all(
     repos.map(repo => gh($, ['api', `repos/${owner}/${repo}/actions/runners`, '--jq', RUNNERS_JQ])),
   )
-  for (const res of perRepo) {
+  // A failed repo list is not "no runners there": keep it, so the pane can say
+  // the inventory is partial, and keep every runner the other lists returned.
+  const repoErrors: RunnerError[] = []
+  perRepo.forEach((res, i) => {
     const r = parse<RawRunner[]>(res)
     if (typeof r !== 'string') r.forEach(x => byId.set(x.id, toRunner(x)))
-  }
-  return { runners: [...byId.values()].sort((a, b) => a.name.localeCompare(b.name)), error }
+    else repoErrors.push({ repo: repos[i] ?? '', error: apiError(r) })
+  })
+  return { runners: [...byId.values()].sort((a, b) => a.name.localeCompare(b.name)), error, repoErrors }
 }
 
 type RawRun = {
@@ -117,8 +129,16 @@ type RawRun = {
 
 const FAILED = new Set(['failure', 'timed_out', 'startup_failure'])
 
-/** Failed jobs of a run, with the step each failed on. Cached by run id by the caller. */
-async function failedJobs($: EngineInterface, owner: string, repo: string, runId: number): Promise<FailedJob[]> {
+/**
+ * Failed jobs of a run, with the step each failed on; preserves lookup errors
+ * so the pane can show failures and apply the rate-limit cooldown.
+ */
+async function failedJobs(
+  $: EngineInterface,
+  owner: string,
+  repo: string,
+  runId: number,
+): Promise<{ jobs: FailedJob[]; error?: ApiError }> {
   const r = parse<FailedJob[]>(
     await gh($, [
       'api',
@@ -127,7 +147,7 @@ async function failedJobs($: EngineInterface, owner: string, repo: string, runId
       '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | {name, url: .html_url, step: ([.steps[]? | select(.conclusion == "failure" or .conclusion == "timed_out") | .name][0] // "")}]',
     ]),
   )
-  return typeof r === 'string' ? [] : r
+  return typeof r === 'string' ? { jobs: [], error: apiError(r) } : { jobs: r }
 }
 
 /** The failed steps' log tail of a run, for `/radar logs`. */
@@ -173,9 +193,9 @@ export async function scanRepo(
     ]),
   )
   if (typeof runs === 'string') {
-    return { summary: { repo, running: 0, queued: 0, recent: [], error: runs }, jobs: [] }
+    return { summary: { repo, running: 0, queued: 0, recent: [], error: apiError(runs) }, jobs: [] }
   }
-  const active = runs.filter(r => ACTIVE.has(r.status)).slice(0, MAX_ACTIVE_RUNS_PER_REPO)
+  const active = runs.filter(r => isActive(r.status)).slice(0, MAX_ACTIVE_RUNS_PER_REPO)
   const recent = runs
     .filter(r => r.status === 'completed')
     .slice(0, 5)
@@ -191,9 +211,9 @@ export async function scanRepo(
           '[.jobs[] | {id, name, status, runner_name, created_at, started_at, labels}]',
         ]),
       )
-      if (typeof r === 'string') return []
-      return r
-        .filter(j => ACTIVE.has(j.status))
+      if (typeof r === 'string') return { jobs: [] as Job[], error: apiError(r) }
+      return { jobs: r
+        .filter(j => isActive(j.status))
         .map(
           (j): Job => ({
             id: j.id,
@@ -207,27 +227,35 @@ export async function scanRepo(
             selfHosted: j.labels.includes('self-hosted'),
             labels: j.labels,
           }),
-        )
+        ), error: undefined as ApiError | undefined }
     }),
   )
-  const jobs = jobLists.flat()
+  const jobs = jobLists.flatMap(result => result.jobs)
+  const jobsError = jobLists.find(result => result.error)?.error
 
   // The latest completed run failed: say what and where (one call per failed run).
   let failure: Failure | undefined
+  let failureError: ApiError | undefined
   const latest = runs.find(r => r.status === 'completed')
   if (latest && FAILED.has(latest.conclusion ?? '')) {
     let failed = failureCache.get(latest.id)
     if (!failed) {
-      failed = await failedJobs($, owner, repo, latest.id)
-      failureCache.set(latest.id, failed)
+      const looked = await failedJobs($, owner, repo, latest.id)
+      if (looked.error) failureError = looked.error
+      else {
+        failed = looked.jobs
+        failureCache.set(latest.id, looked.jobs)
+      }
     }
-    failure = {
-      runId: latest.id,
-      workflow: latest.name,
-      branch: latest.head_branch ?? '',
-      url: latest.html_url,
-      at: time(latest.updated_at),
-      jobs: failed,
+    if (failed) {
+      failure = {
+        runId: latest.id,
+        workflow: latest.name,
+        branch: latest.head_branch ?? '',
+        url: latest.html_url,
+        at: time(latest.updated_at),
+        jobs: failed,
+      }
     }
   }
 
@@ -235,9 +263,10 @@ export async function scanRepo(
     summary: {
       repo,
       running: jobs.filter(j => j.status === 'in_progress').length,
-      queued: jobs.filter(j => j.status !== 'in_progress').length,
+      queued: jobs.filter(j => isPending(j.status)).length,
       recent,
       failure,
+      error: jobsError ?? failureError,
     },
     jobs,
   }
