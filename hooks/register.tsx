@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { ApiError, FailedJob, Savings, SavingsPause, Snapshot } from '../types'
+import type { ApiError, FailedJob, RepoSummary, Savings, SavingsPause, Snapshot } from '../types'
 import { failedLog, getRun, jobsPage, listRepos, listRunners, listRunsPage, ownerKind, scanRepo } from './github'
 import { type Call, caller, DEFAULT_BACKOFF_MS, freshLimiter, type Gh, type Limiter, pause } from './limiter'
 import {
@@ -697,8 +697,9 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
   const working = s.runners.filter(r => r.busy).length
   const nameW = Math.min(20, Math.max(6, ...s.runners.map(r => r.name.length)))
   const stateW = Math.max(t.state.free.length, t.state.working.length, t.state.offline.length)
-  const active = s.repos.filter(r => r.running || r.queued || r.error)
-  const quiet = s.repos.filter(r => !r.running && !r.queued && !r.error)
+  const isActive = (r: RepoSummary) => Boolean(r.running || r.queued || r.unscheduled || r.error)
+  const active = s.repos.filter(isActive)
+  const quiet = s.repos.filter(r => !isActive(r))
   const repoW = Math.min(28, Math.max(4, ...s.repos.map(r => r.repo.length)))
   const clock = await $.clock.now()
   const stale = clock - s.updatedAt > config.intervalMs * 2.5
@@ -775,8 +776,14 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
       {section(t.reposTitle, `${t.reposSummary(s.repos.length)} · ${t.lastRuns}`)}
       {[...active, ...quiet].map(r => {
         const last = r.recent[0]
-        const dot = r.error ? 'red' : r.running || r.queued ? 'yellow' : last ? mark(last).color : 'gray'
-        const activity = r.running || r.queued ? t.repoRow(r.running, r.queued) : t.repoQuiet
+        const busy = r.running || r.queued || r.unscheduled
+        const dot = r.error ? 'red' : busy ? 'yellow' : last ? mark(last).color : 'gray'
+        // Jobs running or waiting, then runs GitHub has not created jobs for yet.
+        const parts = [
+          r.running || r.queued ? t.repoRow(r.running, r.queued) : '',
+          r.unscheduled ? t.repoUnscheduled(r.unscheduled, duration(now - r.unscheduledSince)) : '',
+        ].filter(Boolean)
+        const activity = parts.length ? parts.join(' · ') : t.repoQuiet
         const f = r.failure
         const where = f?.jobs[0] ? t.failedAt(f.jobs[0].name, f.jobs[0].step) : ''
         return (
@@ -792,7 +799,7 @@ async function renderPane($: EngineInterface, e: Parameters<EngineInterface['ui'
                 return <Text color={m.color}>{m.glyph}</Text>
               })}
               <Text>{' '.repeat(RECENT - r.recent.length)}</Text>
-              <Text dimColor={!r.running && !r.queued}>{cut(`  ${activity}`, width - repoW - RECENT - 6)}</Text>
+              <Text dimColor={!busy}>{cut(`  ${activity}`, width - repoW - RECENT - 6)}</Text>
               {r.error && <Text color="red">{cut(`  ${explain(r.error, t)}`, width - repoW - RECENT - activity.length - 8)}</Text>}
             </Text>
             {/* What failed and where, with a way to read the error. */}

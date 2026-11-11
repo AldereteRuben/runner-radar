@@ -46,9 +46,10 @@ Plain words only: a runner is **free**, **working** or **offline**. The pane als
 - **Runners**: free, working or offline (in words, not only colors), and for each working runner the repo, job and how long it has been running.
 - **Queue**: jobs waiting for a **self-hosted** runner (GitHub-hosted jobs are left out), longest wait first, across every watched repo; the wait turns yellow at half the wait alert and red past it.
 - **Repositories**: one row per watched repo, active ones first, with running/waiting jobs and the last five results.
+- **Runs GitHub has not scheduled yet**: a run can sit as "Queued" on GitHub for minutes before GitHub creates its jobs. Until then no runner can take it and it is not in the queue above, so the repo row says `2 runs queued, no jobs yet (14m04s)`, the headline repeats it (a warning once the oldest has waited half the wait alert) and the status line adds `2 runs without jobs yet`. Your runners are not the bottleneck in that case; GitHub is.
 - **What broke**: when a repo's latest run failed, the row says which workflow, branch, job and step failed and how long ago, with a link to the failed job on GitHub. `/radar logs <repo>` prints the failed steps' last log lines right in the conversation.
 - **An estimated GitHub-hosted equivalent**: the minutes that ran on your self-hosted runners this month (and today), per repo, priced at a GitHub-hosted comparison rate you choose. It is a hypothetical figure, not a bill and not money saved (see [the estimate](#the-hosted-equivalent-estimate)). The pane and `/radar savings` say when totals are still incomplete, recalculating, paused, stale or failed, and when they were last updated successfully.
-- **Status line**: `radar · 1/2 online · 1 working · 2 waiting · longest 12m04s`.
+- **Status line**: `radar · 1/2 online · 1 working · 2 waiting · longest 12m04s`, plus `· N runs without jobs yet` when GitHub is holding runs.
 - **Toasts** when a runner goes offline (or comes back), when the queue reaches a threshold, or when a job has waited too long.
 
 It works for organizations (org-level runners) and personal accounts (repo-level runners). When a repo runner query fails, the pane marks the inventory as incomplete and keeps the runners it could read. It does not claim a missing label is definitive while inventory is incomplete.
@@ -147,6 +148,10 @@ How it counts (an estimate, not an invoice reconciliation):
 - Coverage: runs created since 30 days before the UTC month start (GitHub allows re-running a run up to 30 days after it was created), so runs created before the month but executed in it are found. A re-run of a run that is no longer among a repo's newest 100 is found by the daily re-check, so it can appear up to a day late. A run created before that window that still executes this month is not counted. Totals cover the repos being watched.
 
 At terminal widths below 44 columns, Runner Radar shows the headline and a short note to widen the pane. From 44 to 75 columns it uses a compact layout; at 76 columns and above it shows full details.
+
+## What's new in 0.3.2
+
+- **Runs GitHub has not scheduled yet**: runs GitHub reports as `queued` whose job list is still empty are counted per repo, shown in the repo row (`N runs queued, no jobs yet (wait)`), in the headline and in the status line, in English and Spanish. Before, a repo with ten runs "Queued" on GitHub and no jobs looked like "no activity". They stay out of the job queue and its alerts, since there is nothing a runner can take yet. Only the active runs the radar inspects (up to 6 per repo) are counted.
 
 ## What's new in 0.3.1
 

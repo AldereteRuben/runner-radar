@@ -58,6 +58,14 @@ export type RepoSummary = {
   repo: string
   running: number
   queued: number
+  /**
+   * Runs GitHub reports as `queued` without having created any job yet,
+   * among the active runs inspected. Nothing a runner can take: the wait is
+   * on GitHub's side, not the fleet's.
+   */
+  unscheduled: number
+  /** Creation time (ms) of the oldest such run; 0 when there is none. */
+  unscheduledSince: number
   /** Conclusions of the latest completed runs, newest first. */
   recent: string[]
   failure?: Failure

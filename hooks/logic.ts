@@ -85,6 +85,22 @@ export function queue(s: Snapshot): Job[] {
   return s.jobs.filter(j => j.selfHosted && isPending(j.status)).sort((a, b) => a.createdAt - b.createdAt)
 }
 
+/**
+ * Runs GitHub holds in a pending status without having created their jobs yet,
+ * across the watched repos: how many, and when the oldest was created (0 when
+ * none). They are not in `queue`: there is no job for a runner to take.
+ */
+export function unscheduled(s: Snapshot): { count: number; since: number } {
+  let count = 0
+  let since = 0
+  for (const r of s.repos) {
+    if (!r.unscheduled) continue
+    count += r.unscheduled
+    if (r.unscheduledSince && (!since || r.unscheduledSince < since)) since = r.unscheduledSince
+  }
+  return { count, since }
+}
+
 /** The job each busy runner is working on, by runner name. */
 export function assignments(s: Snapshot): Map<string, Job> {
   const map = new Map<string, Job>()
@@ -95,13 +111,15 @@ export function assignments(s: Snapshot): Map<string, Job> {
 export function statusLine(s: Snapshot, now: number, t: Strings): string {
   const waiting = queue(s)
   const oldest = waiting[0]
-  const line = t.status(
+  const base = t.status(
     s.runners.filter(r => r.online).length,
     s.runners.length,
     s.runners.filter(r => r.busy).length,
     waiting.length,
     oldest ? duration(now - oldest.createdAt) : '',
   )
+  const held = unscheduled(s).count
+  const line = held ? `${base} · ${t.statusUnscheduled(held)}` : base
   if (s.error) return `${line} · ${explain(s.error, t)}`
   if (inventory(s) === 'partial') return `${line} · ${t.statusPartial}`
   const repoErrors = s.repos.filter(r => r.error).length
@@ -177,23 +195,28 @@ export function headline(s: Snapshot, now: number, config: AlertConfig, t: Strin
   const partial = s.runnerErrors.length ? t.headline.partial(s.runnerErrors.length) : ''
   const repoErrors = s.repos.filter(r => r.error).length
   const scanWarning = repoErrors ? t.headline.repoErrors(repoErrors) : ''
+  const pending = unscheduled(s)
+  const held = pending.count ? t.headline.unscheduled(pending.count, duration(now - pending.since)) : ''
 
   const bad: string[] = []
   if (s.error && s.runners.length === 0) bad.push(explain(s.error, t))
   if (offline.length === 1 && offline[0]) bad.push(t.headline.runnerOffline(offline[0].name))
   if (offline.length > 1) bad.push(t.headline.runnersOffline(offline.length))
   if (stuck.length) bad.push(t.headline.cantStart(stuck.length))
-  if (bad.length) return { level: 'bad', text: [...bad, wait, partial, scanWarning].filter(Boolean).join(' · ') }
+  if (bad.length) return { level: 'bad', text: [...bad, wait, held, partial, scanWarning].filter(Boolean).join(' · ') }
 
-  if (s.error) return { level: 'warn', text: [explain(s.error, t), wait].filter(Boolean).join(' · ') }
+  if (s.error) return { level: 'warn', text: [explain(s.error, t), wait, held].filter(Boolean).join(' · ') }
 
   // Partial inventory: never "all good", always say the list is incomplete.
-  if (partial || scanWarning) return { level: 'warn', text: [wait, partial, scanWarning].filter(Boolean).join(' · ') }
+  if (partial || scanWarning) return { level: 'warn', text: [wait, held, partial, scanWarning].filter(Boolean).join(' · ') }
 
   const longWait = oldest && waitLevel(now - oldest.createdAt, config.waitAlertMinutes) !== 'ok'
   const bigQueue = config.queueAlert > 0 && waiting.length >= config.queueAlert
-  if (longWait || bigQueue) return { level: 'warn', text: wait }
-  if (waiting.length) return { level: 'ok', text: wait }
+  // Runs GitHub has not scheduled: a warning once the oldest has waited a while.
+  const longHold = pending.count > 0 && waitLevel(now - pending.since, config.waitAlertMinutes) !== 'ok'
+  const text = [wait, held].filter(Boolean).join(' · ')
+  if (longWait || bigQueue || longHold) return { level: 'warn', text }
+  if (text) return { level: 'ok', text }
 
   const busy = s.runners.filter(r => r.busy).length
   if (busy) return { level: 'ok', text: t.headline.working(busy, s.runners.length) }

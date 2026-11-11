@@ -24,6 +24,8 @@ export type Strings = {
   viewOnGitHub: string
   logsHint: (repo: string) => string
   repoRow: (running: number, waiting: number) => string
+  /** Pending runs GitHub has not created jobs for yet, and the oldest one's wait. */
+  repoUnscheduled: (n: number, longest: string) => string
   lastRuns: string
   andMore: (n: number) => string
   updated: (time: string, seconds: number) => string
@@ -55,7 +57,11 @@ export type Strings = {
     waiting: (n: number, longest: string) => string
     partial: (repos: number) => string
     repoErrors: (repos: number) => string
+    /** Pending runs without jobs yet: waiting on GitHub, not on a runner. */
+    unscheduled: (n: number, longest: string) => string
   }
+  /** Status line suffix: pending runs GitHub has not created jobs for yet. */
+  statusUnscheduled: (n: number) => string
   status: (online: number, total: number, working: number, waiting: number, longest: string) => string
   alert: {
     wentOffline: (name: string) => string
@@ -131,6 +137,7 @@ const en: Strings = {
   viewOnGitHub: 'view on GitHub',
   logsHint: repo => `logs: /radar logs ${repo}`,
   repoRow: (running, waiting) => `${running} running · ${waiting} waiting`,
+  repoUnscheduled: (n, longest) => `${n} ${plural(n, 'run', 'runs')} queued, no jobs yet (${longest})`,
   lastRuns: 'last 5 runs',
   andMore: n => `…and ${n} more`,
   updated: (time, s) => `Updated ${time} · refreshes every ${s}s · /radar off to stop`,
@@ -175,7 +182,10 @@ const en: Strings = {
     waiting: (n, longest) => `${n} ${plural(n, 'job', 'jobs')} waiting (longest ${longest})`,
     partial: n => `runner list incomplete (${n} ${plural(n, 'repo', 'repos')} unreadable)`,
     repoErrors: n => `${n} ${plural(n, 'repo scan has', 'repo scans have')} errors`,
+    unscheduled: (n, longest) =>
+      `${n} ${plural(n, 'run', 'runs')} queued at GitHub, no jobs yet (longest ${longest})`,
   },
+  statusUnscheduled: n => `${n} ${plural(n, 'run', 'runs')} without jobs yet`,
   status: (online, total, working, waiting, longest) =>
     [`radar · ${online}/${total} online`, working ? `${working} working` : '', waiting ? `${waiting} waiting · longest ${longest}` : '']
       .filter(Boolean)
@@ -266,6 +276,7 @@ const es: Strings = {
   viewOnGitHub: 'ver en GitHub',
   logsHint: repo => `logs: /radar logs ${repo}`,
   repoRow: (running, waiting) => `${running} corriendo · ${waiting} esperando`,
+  repoUnscheduled: (n, longest) => `${n} ${plural(n, 'run', 'runs')} en cola sin jobs aún (${longest})`,
   lastRuns: 'últimos 5 runs',
   andMore: n => `…y ${n} más`,
   updated: (time, s) => `Actualizado ${time} · se refresca cada ${s} s · /radar off para detener`,
@@ -311,7 +322,10 @@ const es: Strings = {
     waiting: (n, longest) => `${n} ${plural(n, 'job esperando', 'jobs esperando')} (el más largo ${longest})`,
     partial: n => `lista de runners incompleta (${n} ${plural(n, 'repo ilegible', 'repos ilegibles')})`,
     repoErrors: n => `${n} ${plural(n, 'repo tiene', 'repos tienen')} errores de consulta`,
+    unscheduled: (n, longest) =>
+      `${n} ${plural(n, 'run', 'runs')} en cola en GitHub, sin jobs aún (el más largo ${longest})`,
   },
+  statusUnscheduled: n => `${n} ${plural(n, 'run', 'runs')} sin jobs aún`,
   status: (online, total, working, waiting, longest) =>
     [
       `radar · ${online}/${total} conectados`,

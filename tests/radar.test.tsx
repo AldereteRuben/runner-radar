@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { strings } from '../hooks/i18n'
-import { alerts, apiError, duration, freshMemory, headline, layout, parseRepos, partialWarning, queue, reasonFor, statusLine, waitLevel, waitReason } from '../hooks/logic'
+import { alerts, apiError, duration, freshMemory, headline, layout, parseRepos, partialWarning, queue, reasonFor, statusLine, unscheduled, waitLevel, waitReason } from '../hooks/logic'
 import type { Snapshot } from '../types'
 
 const NOW = Date.UTC(2026, 10, 7, 15, 0, 0)
@@ -150,6 +150,51 @@ test('/radar shows working runners, the queue with its reason, and repos', { opt
   await ui.unmount()
 
   expect(toasts.some(x => x.includes('api › lint has waited 12m00s'))).toBe(true)
+})
+
+test('runs GitHub has queued without creating jobs are shown per repo and in the headline', { options: { owner: 'acme' } }, async ($, on) => {
+  // Two queued runs whose job lists are empty: GitHub has not scheduled them,
+  // so no runner can take them and the queue cannot list them.
+  engine(on, [], argv => {
+    const path = argv[2] ?? ''
+    if (path.startsWith('repos/acme/api/actions/runs?')) {
+      return {
+        exitCode: 0,
+        stderr: '',
+        stdout: JSON.stringify([
+          { id: 12, name: 'CI', status: 'queued', conclusion: null, created_at: iso(2 * MIN) },
+          { id: 11, name: 'DB', status: 'queued', conclusion: null, created_at: iso(14 * MIN) },
+          { id: 10, name: 'CI', status: 'in_progress', conclusion: null, created_at: iso(20 * MIN) },
+          { id: 9, name: 'CI', status: 'completed', conclusion: 'success', created_at: iso(60 * MIN) },
+        ]),
+      }
+    }
+    if (path.startsWith('repos/acme/api/actions/runs/11/jobs') || path.startsWith('repos/acme/api/actions/runs/12/jobs')) {
+      return { exitCode: 0, stdout: '[]', stderr: '' }
+    }
+    return fakeGh(argv)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'radar', args: '' })
+  await new Promise(resolve => setTimeout(resolve, 80))
+
+  // Wide enough that the headline is not cut.
+  const wide = { ...PANE, viewport: { columns: 150, rows: 60 }, surface: 'terminal' as const }
+  const ui = await $.ui.mount(wide)
+  expect((await ui.find({ type: 'Text', text: /^✖/ }))?.text).toBe(
+    '✖ box-2 is offline · 1 job waiting (longest 12m00s) · 2 runs queued at GitHub, no jobs yet (longest 14m00s)',
+  )
+  // The queue still lists only real jobs; the repo row says what GitHub is holding.
+  expect(await ui.find({ type: 'Text', text: /Waiting for a runner\s+1 job/ })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /api.*1 running · 2 waiting/ }))?.text).toContain('2 runs queued, no jobs yet (14m00s)')
+  await ui.unmount()
+
+  await $.command.run({ command: 'radar', args: 'es' })
+  await new Promise(resolve => setTimeout(resolve, 80))
+  const es = await $.ui.mount(wide)
+  expect((await es.find({ type: 'Text', text: /^✖/ }))?.text).toContain('2 runs en cola en GitHub, sin jobs aún (el más largo 14m00s)')
+  expect((await es.find({ type: 'Text', text: /api.*1 corriendo · 2 esperando/ }))?.text).toContain('2 runs en cola sin jobs aún (14m00s)')
+  await es.unmount()
 })
 
 test('partial runner API failures are shown and clear after a successful refresh', { options: { owner: 'acme' } }, async ($, on) => {
@@ -399,6 +444,50 @@ test('headline: all good, a warning on a long wait, bad when a job cannot start'
   expect(waitLevel(4 * MIN, 10)).toBe('ok')
   expect(waitLevel(5 * MIN, 10)).toBe('warn')
   expect(waitLevel(10 * MIN, 10)).toBe('bad')
+})
+
+const repoSummary = (repo: string, unscheduled: number, minutesAgo: number) => ({
+  repo,
+  running: 0,
+  queued: 0,
+  unscheduled,
+  unscheduledSince: unscheduled ? NOW - minutesAgo * MIN : 0,
+  recent: [],
+})
+
+test('unscheduled runs: counted across repos, oldest first, in the headline and status line', () => {
+  const config = { queueAlert: 5, waitAlertMinutes: 10 }
+  const repos = [repoSummary('api', 2, 3), repoSummary('web', 1, 7), repoSummary('docs', 0, 0)]
+  expect(unscheduled(base({ repos }))).toEqual({ count: 3, since: NOW - 7 * MIN })
+  expect(unscheduled(base())).toEqual({ count: 0, since: 0 })
+
+  // Nothing in the job queue: the headline still says what GitHub is holding, ok while recent.
+  expect(headline(base({ repos }), NOW, config, en)).toEqual({
+    level: 'warn',
+    text: '3 runs queued at GitHub, no jobs yet (longest 7m00s)',
+  })
+  expect(headline(base({ repos: [repoSummary('api', 1, 2)] }), NOW, config, en)).toEqual({
+    level: 'ok',
+    text: '1 run queued at GitHub, no jobs yet (longest 2m00s)',
+  })
+  expect(headline(base({ repos: [repoSummary('api', 1, 2)] }), NOW, config, es).text).toBe(
+    '1 run en cola en GitHub, sin jobs aún (el más largo 2m00s)',
+  )
+  // Alongside a real queue, and a bad headline keeps it too.
+  expect(headline(base({ repos, jobs: [job(1, 1)] }), NOW, config, en).text).toBe(
+    '1 job waiting (longest 1m00s) · 3 runs queued at GitHub, no jobs yet (longest 7m00s)',
+  )
+  const gpu = { ...job(2, 1), labels: ['self-hosted', 'gpu'] }
+  expect(headline(base({ repos, jobs: [gpu] }), NOW, config, en)).toEqual({
+    level: 'bad',
+    text: "1 job can't start · 1 job waiting (longest 1m00s) · 3 runs queued at GitHub, no jobs yet (longest 7m00s)",
+  })
+
+  expect(statusLine(base({ repos }), NOW, en)).toBe('radar · 1/1 online · 3 runs without jobs yet')
+  expect(statusLine(base({ repos, jobs: [job(1, 2)] }), NOW, es)).toBe('radar · 1/1 conectados · 1 esperando · máx 2m00s · 3 runs sin jobs aún')
+  // Unscheduled runs are never in the job queue nor its alerts.
+  expect(queue(base({ repos }))).toEqual([])
+  expect(alerts(null, base({ repos }), NOW, config, freshMemory(), en)).toEqual([])
 })
 
 test('parseRepos accepts names and owner/name, trims and drops blanks', () => {

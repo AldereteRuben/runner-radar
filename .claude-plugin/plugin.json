@@ -1,7 +1,7 @@
 {
   "name": "runner-radar",
   "displayName": "Runner Radar",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Live radar for your self-hosted GitHub Actions runners inside Claude Code: who is busy with what, what is waiting and why, what broke, and an estimated GitHub-hosted equivalent of the minutes your runners ran.",
   "author": {
     "name": "Ruben Alderete",

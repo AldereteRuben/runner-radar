@@ -256,7 +256,7 @@ export async function scanRepo(
     ]),
   )
   if (typeof runs === 'string') {
-    return { summary: { repo, running: 0, queued: 0, recent: [], error: apiError(runs) }, jobs: [] }
+    return { summary: { repo, running: 0, queued: 0, unscheduled: 0, unscheduledSince: 0, recent: [], error: apiError(runs) }, jobs: [] }
   }
   const active = runs.filter(r => isActive(r.status)).slice(0, MAX_ACTIVE_RUNS_PER_REPO)
   const recent = runs
@@ -274,8 +274,8 @@ export async function scanRepo(
           '[.jobs[] | {id, name, status, runner_name, created_at, started_at, labels}]',
         ]),
       )
-      if (typeof r === 'string') return { jobs: [] as Job[], error: apiError(r) }
-      return { jobs: r
+      if (typeof r === 'string') return { jobs: [] as Job[], error: apiError(r), none: false }
+      return { none: r.length === 0, jobs: r
         .filter(j => isActive(j.status))
         .map(
           (j): Job => ({
@@ -295,6 +295,13 @@ export async function scanRepo(
   )
   const jobs = jobLists.flatMap(result => result.jobs)
   const jobsError = jobLists.find(result => result.error)?.error
+
+  // A `queued` run whose job list came back empty: GitHub has not scheduled it
+  // yet, so no runner can take it and the queue above cannot show it. Only
+  // `queued`: a `pending` run is held by a concurrency group and a `waiting`
+  // one by a deployment approval, which are not GitHub delays.
+  const unscheduledRuns = active.filter((run, i) => run.status === 'queued' && jobLists[i]?.none)
+  const unscheduledSince = unscheduledRuns.length ? Math.min(...unscheduledRuns.map(r => time(r.created_at))) : 0
 
   // The latest completed run failed: say what and where (one call per failed run).
   let failure: Failure | undefined
@@ -327,6 +334,8 @@ export async function scanRepo(
       repo,
       running: jobs.filter(j => j.status === 'in_progress').length,
       queued: jobs.filter(j => isPending(j.status)).length,
+      unscheduled: unscheduledRuns.length,
+      unscheduledSince,
       recent,
       failure,
       error: jobsError ?? failureError,
